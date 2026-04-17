@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         RingCentral Group Member Watcher (群成员在线一览)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.3.0
-// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组成员的真实头像与在线状态。v1.3.0 修复 styled-components 哈希类名导致 presence 全部判定为 unknown 的根因；改用 data-test-automation-id="presence" 的 type/title 属性；按 data-id=GLIP_PERSON.<id> 精确匹配；从 <canvas>.toDataURL() 抓取真实头像。
+// @version      1.3.1
+// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组成员的真实头像与在线状态。v1.3.1 修复 styled-components 哈希类名导致 presence 无法识别、以及头像只显示缩写的问题；改用 data-test-automation-id 锚点与 canvas.toDataURL 捕获真实头像。
 // @author       Anna Su
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -16,10 +16,10 @@
 
     // ---------- 0. CSS ----------
     const CSS = [
-        "#__RCPW_FAB__{position:fixed;right:22px;bottom:22px;width:54px;height:54px;border-radius:50%;background:#ff7a00;color:#fff;display:flex;align-items:center;justify-content:center;font-size:26px;cursor:pointer;box-shadow:0 6px 20px rgba(255,122,0,.45);z-index:2147483000;transition:transform .15s ease;user-select:none}",
+        "#__RCPW_FAB__{position:fixed;right:22px;bottom:22px;width:54px;height:54px;border-radius:50%;background:#ff7a00;color:#fff;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 6px 16px rgba(0,0,0,.25);cursor:pointer;z-index:2147483646;user-select:none;transition:transform .15s}",
         "#__RCPW_FAB__:hover{transform:scale(1.08)}",
-        "#__RCPW_PANEL__{position:fixed;right:22px;bottom:90px;width:360px;max-height:70vh;background:#fff;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.22);z-index:2147483001;display:flex;flex-direction:column;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#222}",
-        "#__RCPW_PANEL__ .hdr{background:#ff7a00;color:#fff;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between}",
+        "#__RCPW_PANEL__{position:fixed;right:22px;bottom:90px;width:360px;max-height:70vh;background:#fff;border-radius:14px;box-shadow:0 12px 32px rgba(0,0,0,.25);display:none;flex-direction:column;overflow:hidden;z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#222}",
+        "#__RCPW_PANEL__ .hdr{background:#ff7a00;color:#fff;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:8px}",
         "#__RCPW_PANEL__ .hdr h3{margin:0;font-size:16px;font-weight:600}",
         "#__RCPW_PANEL__ .hdr .ver{opacity:.85;font-weight:400;font-size:12px;margin-left:6px}",
         "#__RCPW_PANEL__ .hdr .sub{font-size:12px;opacity:.9;margin-top:4px}",
@@ -28,431 +28,361 @@
         "#__RCPW_PANEL__ .bar button{border:1px solid #e3e3e3;background:#fafafa;padding:6px 10px;border-radius:8px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:4px}",
         "#__RCPW_PANEL__ .bar button:hover{background:#f0f0f0}",
         "#__RCPW_PANEL__ .bar .tip{flex:1;text-align:right;font-size:11px;color:#888}",
-        "#__RCPW_PANEL__ .list{overflow-y:auto;flex:1}",
-        "#__RCPW_PANEL__ .sec{padding:8px 14px;font-size:12px;font-weight:600;color:#ff7a00;background:#fff7ee;display:flex;align-items:center;gap:6px}",
-        "#__RCPW_PANEL__ .sec .dot{width:8px;height:8px;border-radius:50%}",
-        "#__RCPW_PANEL__ .row{display:flex;gap:10px;padding:10px 14px;border-bottom:1px solid #f3f3f3;align-items:center}",
-        "#__RCPW_PANEL__ .row:hover{background:#fafafa}",
-        "#__RCPW_PANEL__ .avatar{width:40px;height:40px;border-radius:50%;background-color:#bbb;background-size:cover;background-position:center;background-repeat:no-repeat;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:14px;letter-spacing:.5px;overflow:hidden}",
-        "#__RCPW_PANEL__ .avatar .p{position:absolute;right:-1px;bottom:-1px;width:12px;height:12px;border-radius:50%;border:2px solid #fff;background:#bbb}",
-        "#__RCPW_PANEL__ .avatar .p.available{background:#2ecc71}",
-        "#__RCPW_PANEL__ .avatar .p.do-not-disturb{background:#e74c3c}",
-        "#__RCPW_PANEL__ .avatar .p.away{background:#f1c40f}",
-        "#__RCPW_PANEL__ .avatar .p.invisible,#__RCPW_PANEL__ .avatar .p.offline,#__RCPW_PANEL__ .avatar .p.unknown{background:#bbb}",
-        "#__RCPW_PANEL__ .meta{flex:1;min-width:0}",
-        "#__RCPW_PANEL__ .name{font-size:14px;font-weight:600;color:#222;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-        "#__RCPW_PANEL__ .sig{font-size:12px;color:#888;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-        "#__RCPW_PANEL__ .sig.empty{color:#bbb;font-style:italic}"
-    ].join("\n");
+        "#__RCPW_PANEL__ .body{overflow:auto;flex:1}",
+        "#__RCPW_PANEL__ .sec{padding:8px 14px 0}",
+        "#__RCPW_PANEL__ .sec h4{font-size:12px;color:#666;margin:6px 0 4px;font-weight:600;display:flex;align-items:center;gap:6px}",
+        "#__RCPW_PANEL__ .sec h4 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}",
+        "#__RCPW_PANEL__ ul{list-style:none;margin:0;padding:0 8px 8px}",
+        "#__RCPW_PANEL__ li{display:flex;align-items:center;gap:10px;padding:6px 6px;border-radius:8px}",
+        "#__RCPW_PANEL__ li:hover{background:#f7f7f7}",
+        "#__RCPW_PANEL__ li .av{width:32px;height:32px;border-radius:50%;background:#ccc;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:600;flex-shrink:0;background-size:cover;background-position:center;position:relative;overflow:visible}",
+        "#__RCPW_PANEL__ li .av .pdot{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:50%;border:2px solid #fff;background:#bbb}",
+        "#__RCPW_PANEL__ li .nm{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+        "#__RCPW_PANEL__ .empty{padding:18px;color:#888;font-size:12px;text-align:center}",
+        "#__RCPW_PANEL__ .ft{padding:8px 12px;border-top:1px solid #eee;font-size:11px;color:#999;display:flex;justify-content:space-between}"
+    ].join('');
 
-    const LOG = (...a) => console.log('%c[RCPW]', 'color:#ff7a00;font-weight:bold', ...a);
+    // ---------- 1. utils ----------
+    const LOG = (...a) => console.log('%c[RCPW]', 'color:#ff7a00;font-weight:600', ...a);
     const WARN = (...a) => console.warn('[RCPW]', ...a);
-    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    const $ = (sel, root) => (root || document).querySelector(sel);
-    const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
-    const collator = new Intl.Collator(['zh-Hans', 'en'], { sensitivity: 'base', numeric: true });
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const $ = (sel, root = document) => root.querySelector(sel);
+    const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+    const collator = new Intl.Collator(['zh', 'en'], { sensitivity: 'base' });
 
-    // ---------- Avatar fallback helpers ----------
     function deriveInitials(name) {
         if (!name) return '?';
-        const t = name.trim();
-        if (/^[\u4e00-\u9fa5]/.test(t)) return t[0];
-        const words = t.split(/\s+/).filter(Boolean);
-        if (words.length === 1) return (words[0][0] || '?').toUpperCase();
-        return ((words[0][0] || '') + (words[words.length - 1][0] || '')).toUpperCase();
+        const parts = String(name).trim().split(/\s+/);
+        if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+        return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
     }
     function nameColor(name) {
         let h = 0;
-        const s = name || '';
-        for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-        return 'hsl(' + (h % 360) + ', 55%, 52%)';
+        for (const c of String(name || '')) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+        const hue = h % 360;
+        return 'hsl(' + hue + ',55%,55%)';
     }
 
-    // ---------- GlipDB (IndexedDB 'Glip') ----------
-    const GlipDB = (function () {
+    // ---------- 2. Glip IndexedDB (best-effort; used to seed member list by group id) ----------
+    const GlipDB = (() => {
         let dbPromise = null;
         function open() {
             if (dbPromise) return dbPromise;
             dbPromise = new Promise((resolve, reject) => {
-                const req = indexedDB.open('Glip');
-                req.onsuccess = () => resolve(req.result);
-                req.onerror = () => reject(req.error);
-            });
+                try {
+                    // Find the Glip DB name: RingCentral stores it as "glip_*"
+                    const req = indexedDB.databases ? indexedDB.databases() : Promise.resolve([]);
+                    Promise.resolve(req).then(list => {
+                        const glip = (list || []).find(d => /glip/i.test(d.name || ''));
+                        if (!glip) return reject(new Error('no glip db'));
+                        const openReq = indexedDB.open(glip.name);
+                        openReq.onsuccess = () => resolve(openReq.result);
+                        openReq.onerror = () => reject(openReq.error);
+                    }).catch(reject);
+                } catch (e) { reject(e); }
+            }).catch(err => { dbPromise = null; throw err; });
             return dbPromise;
         }
-        function getAll(storeName) {
+        function tx(db, store) {
+            return db.transaction(store, 'readonly').objectStore(store);
+        }
+        function getAll(store) {
             return open().then(db => new Promise((resolve, reject) => {
-                if (!db.objectStoreNames.contains(storeName)) return resolve([]);
-                const tx = db.transaction(storeName, 'readonly');
-                const req = tx.objectStore(storeName).getAll();
-                req.onsuccess = () => resolve(req.result || []);
-                req.onerror = () => reject(req.error);
-            }));
+                try {
+                    const r = tx(db, store).getAll();
+                    r.onsuccess = () => resolve(r.result || []);
+                    r.onerror = () => reject(r.error);
+                } catch (e) { reject(e); }
+            })).catch(() => []);
         }
-        function get(storeName, key) {
+        function get(store, key) {
             return open().then(db => new Promise((resolve, reject) => {
-                if (!db.objectStoreNames.contains(storeName)) return resolve(null);
-                const tx = db.transaction(storeName, 'readonly');
-                const req = tx.objectStore(storeName).get(key);
-                req.onsuccess = () => resolve(req.result || null);
-                req.onerror = () => reject(req.error);
-            }));
+                try {
+                    const r = tx(db, store).get(key);
+                    r.onsuccess = () => resolve(r.result);
+                    r.onerror = () => reject(r.error);
+                } catch (e) { reject(e); }
+            })).catch(() => null);
         }
-        async function getGroup(groupId) {
-            const gid = String(groupId);
-            const byNum = await get('group', Number(gid)).catch(() => null);
-            if (byNum) return byNum;
-            const byStr = await get('group', gid).catch(() => null);
-            if (byStr) return byStr;
-            const all = await getAll('group').catch(() => []);
-            return all.find(g => String(g.id) === gid) || null;
-        }
-        async function getPersonsByIds(ids) {
-            if (!ids || !ids.length) return [];
-            const db = await open();
-            if (!db.objectStoreNames.contains('person')) return [];
-            return new Promise((resolve) => {
-                const tx = db.transaction('person', 'readonly');
-                const store = tx.objectStore('person');
-                const out = [];
-                let pending = ids.length;
-                if (pending === 0) return resolve([]);
-                ids.forEach(id => {
-                    const tryKeys = [Number(id), String(id)];
-                    let tried = 0;
-                    const next = () => {
-                        if (tried >= tryKeys.length) { if (--pending === 0) resolve(out); return; }
-                        const k = tryKeys[tried++];
-                        const req = store.get(k);
-                        req.onsuccess = () => {
-                            if (req.result) { out.push(req.result); if (--pending === 0) resolve(out); }
-                            else { next(); }
-                        };
-                        req.onerror = () => next();
-                    };
-                    next();
-                });
-            });
+        function getGroup(gid) { return get('group', String(gid)); }
+        function getPersonsByIds(ids) {
+            return open().then(db => {
+                const store = tx(db, 'person');
+                return Promise.all(ids.map(id => new Promise(res => {
+                    const r = store.get(String(id));
+                    r.onsuccess = () => res(r.result || null);
+                    r.onerror = () => res(null);
+                })));
+            }).catch(() => ids.map(() => null));
         }
         return { open, getAll, get, getGroup, getPersonsByIds };
     })();
 
-    // ---------- Presence classification (FIXED in v1.3.0) ----------
-    // Lower rank = "more online"; used for merge-tiebreak and ordering.
-    const PRESENCE_RANK = {
-        'available': 1,
-        'do-not-disturb': 2,
-        'away': 3,
-        'invisible': 4,
-        'offline': 5,
-        'unknown': 6
+    // ---------- 3. presence ----------
+    const PRESENCE_RANK = { available: 0, busy: 1, doNotDisturb: 2, inMeeting: 3, onCall: 4, away: 5, offline: 6, unknown: 7 };
+    function normalizePresence(tok) {
+        if (!tok) return 'unknown';
+        const s = String(tok).toLowerCase();
+        if (/\bavailable\b|online/.test(s)) return 'available';
+        if (/donotdisturb|do-not-disturb|do_not_disturb|\bdnd\b/.test(s)) return 'doNotDisturb';
+        if (/inmeeting|in-meeting|in_meeting|meeting/.test(s)) return 'inMeeting';
+        if (/oncall|on-call|on_call|\bcall\b/.test(s)) return 'onCall';
+        if (/\bbusy\b/.test(s)) return 'busy';
+        if (/\baway\b|idle/.test(s)) return 'away';
+        if (/offline|invisible|unavailable/.test(s)) return 'offline';
+        return 'unknown';
+    }
+    const PRESENCE_COLOR = {
+        available: '#2ecc71', busy: '#e67e22', doNotDisturb: '#e74c3c',
+        inMeeting: '#9b59b6', onCall: '#e74c3c', away: '#f1c40f',
+        offline: '#bdbdbd', unknown: '#bdbdbd'
     };
-
-    // Accept whatever token RingCentral puts into `type` / `title` / icon-class
-    // and fold it into our canonical bucket.
-    function normalizePresenceToken(tok) {
-        if (!tok) return null;
-        const s = String(tok).toLowerCase().trim();
-        if (!s) return null;
-
-        // Exact matches first
-        if (s === 'available' || s === 'check' || s === 'online' || s === 'active') return 'available';
-        if (s === 'dnd' || s === 'do-not-disturb' || s === 'donotdisturb' || s === 'busy'
-            || s === 'in-meeting' || s === 'inmeeting' || s === 'on-call' || s === 'oncall'
-            || s === 'on a call' || s === 'in a meeting') return 'do-not-disturb';
-        if (s === 'away' || s === 'brb' || s === 'idle') return 'away';
-        if (s === 'invisible' || s === 'hidden') return 'invisible';
-        if (s === 'offline' || s === 'unavailable' || s === 'notavailable') return 'offline';
-
-        // Fuzzy fallback on compound strings (e.g. icon className "sc-xx eAamrG offline icon")
-        if (s.indexOf('do-not-disturb') >= 0 || s.indexOf(' dnd') >= 0 || s.indexOf('busy') >= 0
-            || s.indexOf('in-meeting') >= 0 || s.indexOf('on-call') >= 0) return 'do-not-disturb';
-        if (s.indexOf('available') >= 0 || s.indexOf('check') >= 0) return 'available';
-        if (s.indexOf('away') >= 0) return 'away';
-        if (s.indexOf('invisible') >= 0) return 'invisible';
-        if (s.indexOf('offline') >= 0 || s.indexOf('unavailable') >= 0) return 'offline';
-        return null;
+    const PRESENCE_LABEL = {
+        available: '在线', busy: '忙碌', doNotDisturb: '勿扰',
+        inMeeting: '会议中', onCall: '通话中', away: '离开',
+        offline: '离线', unknown: '未知'
+    };
+    function betterPresence(a, b) {
+        const ra = PRESENCE_RANK[a] ?? 99, rb = PRESENCE_RANK[b] ?? 99;
+        return ra <= rb ? a : b;
     }
 
-    // Read a single member row (<li> or role=listitem) inside the Members dialog.
-    // Returns { personId, name, presence, avatarDataUrl, shortName, shortBg } or null.
+    // ---------- 4. DOM snapshot ----------
+    // Each member row in both the right-side panel and the members dialog
+    // renders a presence pill with:
+    //   [data-test-automation-id="presence"][data-id="GLIP_PERSON.<id>"]
+    //     type="available|unavailable|doNotDisturb|inMeeting|onCall|..."
+    //     title="Available|Offline|Busy|Do not disturb|In a meeting|On a call|..."
+    // Avatars are either <canvas> (real image) or <span class="avatar-short-name"> (initials).
+    function captureCanvasAvatar(row) {
+        try {
+            const cvs = row.querySelector('.RcAvatar-avatarContainer canvas, canvas');
+            if (!cvs || !cvs.width || !cvs.height) return '';
+            return cvs.toDataURL('image/png');
+        } catch (e) { return ''; }
+    }
+    function readShortNameNode(row) {
+        return row.querySelector('.avatar-short-name, .RcAvatar-short-name, [class*="short-name"]');
+    }
     function readRowProfile(row) {
-        if (!row) return null;
-
-        // 1) Canonical presence indicator: data-test-automation-id="presence"
-        const pres = row.querySelector('[data-test-automation-id="presence"][data-id^="GLIP_PERSON"]');
-        let personId = null, presence = null;
-        if (pres) {
-            const did = pres.getAttribute('data-id') || '';
-            personId = did.replace('GLIP_PERSON.', '') || null;
-            presence = normalizePresenceToken(pres.getAttribute('type'))
-                || normalizePresenceToken(pres.getAttribute('title'));
-            if (!presence) {
-                const iconSpan = pres.querySelector('span.icon');
-                if (iconSpan) presence = normalizePresenceToken(iconSpan.className);
-            }
+        const presenceEl = row.querySelector('[data-test-automation-id="presence"][data-id^="GLIP_PERSON"]')
+            || row.querySelector('[data-test-automation-id="presence"]');
+        let personId = null, presence = 'unknown';
+        if (presenceEl) {
+            const did = presenceEl.getAttribute('data-id') || '';
+            const m = did.match(/GLIP_PERSON\.(\d+)/);
+            if (m) personId = m[1];
+            const type = presenceEl.getAttribute('type') || '';
+            const title = presenceEl.getAttribute('title') || '';
+            presence = normalizePresence(type) !== 'unknown'
+                ? normalizePresence(type)
+                : normalizePresence(title);
         }
-        if (!presence) {
-            // Fallback path: any icon span inside the avatar presence wrapper
-            const iconSpan = row.querySelector('.RcAvatar-presenceWrapper span.icon');
-            if (iconSpan) presence = normalizePresenceToken(iconSpan.className);
-        }
-        presence = presence || 'unknown';
-
-        // 2) Display name
+        // Name
         let name = '';
-        const nameEl =
-            row.querySelector('[data-test-automation-id="profileDialogMemberListItemPersonName"]')
-            || row.querySelector('.MuiListItemText-primary')
-            || row.querySelector('[data-test-automation-id*="name"], .member-name, span, p');
-        if (nameEl) name = (nameEl.textContent || '').trim();
-
-        // 3) Real avatar: prefer capturing the rendered <canvas> as a data URL
-        let avatarDataUrl = null, shortName = null, shortBg = null;
-        const canvas = row.querySelector('.RcAvatar-avatarContainer canvas');
-        if (canvas) {
-            try { avatarDataUrl = canvas.toDataURL('image/png'); } catch (_) { avatarDataUrl = null; }
+        const nameEl = row.querySelector('[data-test-automation-id*="name"], .name, [class*="Name"]');
+        if (nameEl && nameEl.textContent) name = nameEl.textContent.trim();
+        if (!name) {
+            // Fallback: take the longest text node in the row
+            const txt = row.textContent.trim().split(/\n+/).map(s => s.trim()).filter(Boolean);
+            if (txt.length) name = txt[0];
         }
-        const sn = row.querySelector('.RcAvatar-avatarContainer .avatar-short-name');
-        if (sn) {
-            shortName = (sn.textContent || '').trim() || null;
-            const container = sn.closest('.RcAvatar-avatarContainer');
-            if (container) {
-                const cs = getComputedStyle(container);
-                if (cs && cs.backgroundColor
-                    && cs.backgroundColor !== 'rgba(0, 0, 0, 0)'
-                    && cs.backgroundColor !== 'transparent') {
-                    shortBg = cs.backgroundColor;
-                }
+        // Avatar
+        const dataUrl = captureCanvasAvatar(row);
+        let initials = '', bg = '';
+        if (!dataUrl) {
+            const sn = readShortNameNode(row);
+            if (sn) {
+                initials = (sn.textContent || '').trim();
+                const cs = getComputedStyle(sn);
+                bg = cs.backgroundColor || cs.background || '';
             }
         }
-
-        if (!personId && !name) return null;
-        return { personId, name, presence, avatarDataUrl, shortName, shortBg };
+        if (!initials) initials = deriveInitials(name);
+        if (!bg) bg = nameColor(name);
+        return { personId, name, presence, avatarDataUrl: dataUrl, initials, bg };
     }
-
-    // Scan the open members dialog, return { byId: Map, byName: Map } snapshot.
-    function snapshotFromDom(root) {
+    function snapshotFromDom() {
         const byId = new Map();
         const byName = new Map();
-        const rows = $$('[role="dialog"] [role="listitem"], [role="dialog"] li', root);
+        // Members dialog rows
+        const rows = new Set();
+        // Group chat members dialog rows
+        $$('[data-test-automation-id="team-member-item"], [data-test-automation-id*="member-item"], [data-test-automation-id*="MemberItem"]').forEach(r => rows.add(r));
+        // Right-side team members list
+        $$('[data-test-automation-id="presence"][data-id^="GLIP_PERSON"]').forEach(p => {
+            // Walk up to the visible row container
+            let el = p, hops = 0;
+            while (el && hops < 8) {
+                if (el.offsetHeight >= 28) { rows.add(el); break; }
+                el = el.parentElement; hops++;
+            }
+        });
         rows.forEach(row => {
-            const p = readRowProfile(row);
-            if (!p) return;
-            if (p.personId) {
-                const prev = byId.get(p.personId);
-                if (!prev
-                    || PRESENCE_RANK[p.presence] < PRESENCE_RANK[prev.presence]
-                    || (prev.presence === p.presence && !prev.avatarDataUrl && p.avatarDataUrl)
-                    || (prev.presence === p.presence && !prev.shortName && p.shortName)) {
-                    byId.set(p.personId, p);
-                }
-            } else if (p.name) {
-                const k = p.name.toLowerCase();
+            const prof = readRowProfile(row);
+            if (!prof) return;
+            if (prof.personId) {
+                const prev = byId.get(prof.personId);
+                if (!prev) byId.set(prof.personId, prof);
+                else byId.set(prof.personId, mergeProfile(prev, prof));
+            }
+            if (prof.name) {
+                const k = prof.name.toLowerCase();
                 const prev = byName.get(k);
-                if (!prev || PRESENCE_RANK[p.presence] < PRESENCE_RANK[prev.presence]) {
-                    byName.set(k, p);
-                }
+                if (!prev) byName.set(k, prof);
+                else byName.set(k, mergeProfile(prev, prof));
             }
         });
         return { byId, byName };
     }
+    function mergeProfile(a, b) {
+        return {
+            personId: a.personId || b.personId,
+            name: a.name || b.name,
+            presence: betterPresence(a.presence, b.presence),
+            avatarDataUrl: a.avatarDataUrl || b.avatarDataUrl,
+            initials: a.initials || b.initials,
+            bg: a.bg || b.bg
+        };
+    }
+    function mergeSnap(dst, snap) {
+        snap.byId.forEach((v, k) => {
+            const prev = dst.byId.get(k);
+            dst.byId.set(k, prev ? mergeProfile(prev, v) : v);
+        });
+        snap.byName.forEach((v, k) => {
+            const prev = dst.byName.get(k);
+            dst.byName.set(k, prev ? mergeProfile(prev, v) : v);
+        });
+    }
 
+    // ---------- 5. Auto collector: observes DOM for member rows appearing ----------
     const AutoCollector = {
-        findMembersButton() {
-            return $$('button, [role="button"], a').find(el => /Members\s*\(\d+\)/i.test((el.textContent || '').trim()));
+        _observer: null,
+        _cache: { byId: new Map(), byName: new Map() },
+        start() {
+            if (this._observer) return;
+            this._snapshotNow();
+            this._observer = new MutationObserver(() => {
+                clearTimeout(this._t);
+                this._t = setTimeout(() => this._snapshotNow(), 250);
+            });
+            this._observer.observe(document.body, { childList: true, subtree: true });
         },
-        async openDialog() {
-            if ($('[role="dialog"] [role="listitem"], [role="dialog"] li')) return true;
-            const btn = this.findMembersButton();
-            if (!btn) return false;
-            btn.click();
-            for (let i = 0; i < 30; i++) {
-                await sleep(100);
-                if ($('[role="dialog"] [role="listitem"], [role="dialog"] li')) return true;
-            }
-            return false;
+        stop() {
+            if (this._observer) { this._observer.disconnect(); this._observer = null; }
         },
-        findScroller() {
-            const dlg = $('[role="dialog"]');
-            if (!dlg) return null;
-            return $$('*', dlg).find(el => el.scrollHeight > el.clientHeight + 10 && el.querySelector('[role="listitem"], li')) || null;
+        _snapshotNow() {
+            try {
+                const snap = snapshotFromDom();
+                mergeSnap(this._cache, snap);
+            } catch (e) { /* ignore */ }
         },
-        async scanAll(onProgress) {
-            const mergedById = new Map();
-            const mergedByName = new Map();
-
-            const merge = (snap) => {
-                snap.byId.forEach((v, k) => {
-                    const prev = mergedById.get(k);
-                    if (!prev) { mergedById.set(k, v); return; }
-                    const better =
-                        PRESENCE_RANK[v.presence] < PRESENCE_RANK[prev.presence]
-                        || (!prev.avatarDataUrl && v.avatarDataUrl)
-                        || (!prev.shortName && v.shortName);
-                    if (better) {
-                        mergedById.set(k, {
-                            ...prev,
-                            ...v,
-                            presence: PRESENCE_RANK[v.presence] < PRESENCE_RANK[prev.presence] ? v.presence : prev.presence,
-                            avatarDataUrl: v.avatarDataUrl || prev.avatarDataUrl,
-                            shortName: v.shortName || prev.shortName,
-                            shortBg: v.shortBg || prev.shortBg
-                        });
-                    }
-                });
-                snap.byName.forEach((v, k) => {
-                    const prev = mergedByName.get(k);
-                    if (!prev || PRESENCE_RANK[v.presence] < PRESENCE_RANK[prev.presence]) mergedByName.set(k, v);
-                });
-            };
-
-            const opened = await this.openDialog();
-            if (!opened) { WARN('open dialog failed'); return { byId: mergedById, byName: mergedByName }; }
-            await sleep(300);
-
-            const scroller = this.findScroller();
-            merge(snapshotFromDom());
-            if (onProgress) onProgress(mergedById.size);
-            if (!scroller) return { byId: mergedById, byName: mergedByName };
-
-            let lastTop = -1, stable = 0;
-            for (let step = 0; step < 400; step++) {
-                scroller.scrollTop = scroller.scrollTop + Math.max(200, scroller.clientHeight - 40);
-                await sleep(140);
-                merge(snapshotFromDom());
-                if (onProgress) onProgress(mergedById.size);
-                if (scroller.scrollTop === lastTop) {
-                    if (++stable >= 3) break;
-                } else {
-                    stable = 0;
-                    lastTop = scroller.scrollTop;
-                }
-            }
-            // One more pass so the last visible rows' canvases get captured.
-            await sleep(200);
-            merge(snapshotFromDom());
-            if (onProgress) onProgress(mergedById.size);
-
-            const closeBtn = $('[role="dialog"] [aria-label*="close" i], [role="dialog"] button[title*="close" i]');
-            if (closeBtn) closeBtn.click();
-            return { byId: mergedById, byName: mergedByName };
-        }
+        reset() { this._cache = { byId: new Map(), byName: new Map() }; },
+        get cache() { return this._cache; }
     };
 
+    // ---------- 6. current group / aggregation ----------
     function currentGroupId() {
-        const m = location.pathname.match(/\/messages\/(\d+)/);
+        const m = location.pathname.match(/\/messages?\/(\d+)/);
         return m ? m[1] : null;
     }
-
-    async function aggregate(groupId, domById, domByName) {
-        const group = await GlipDB.getGroup(groupId);
-        if (!group) return { group: null, members: [] };
-        const memberIds = group.members || group.member_ids || [];
-        const persons = await GlipDB.getPersonsByIds(memberIds);
-
-        const members = persons.map(p => {
-            const pid = String(p.id);
-            const name = (p.display_name
-                || ((p.first_name || '') + ' ' + (p.last_name || '')).trim()
-                || p.email || 'Unknown').trim();
-            const dom = (domById && domById.get(pid))
-                || (domByName && domByName.get(name.toLowerCase()))
-                || null;
-            return {
-                id: pid,
-                name,
-                presence: (dom && dom.presence) || 'unknown',
-                signature: (p.headline || p.away_status || '').trim(),
-                awayStatusUpdatedAt: p.away_status_updated_at || 0,
-                avatarDataUrl: (dom && dom.avatarDataUrl) || null,
-                initials: (dom && dom.shortName) || deriveInitials(name),
-                color: (dom && dom.shortBg) || nameColor(name)
-            };
+    async function aggregate() {
+        AutoCollector._snapshotNow();
+        const cache = AutoCollector.cache;
+        const gid = currentGroupId();
+        let members = [];
+        if (gid) {
+            try {
+                const group = await GlipDB.getGroup(gid);
+                const ids = (group && (group.members || group.member_ids)) || [];
+                if (ids.length) {
+                    const people = await GlipDB.getPersonsByIds(ids);
+                    people.forEach((p, i) => {
+                        if (!p) { members.push({ personId: String(ids[i]), name: '', presence: 'unknown' }); return; }
+                        const pid = String(p.id || ids[i]);
+                        const nm = (p.display_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email || '').trim();
+                        const fromDom = cache.byId.get(pid) || cache.byName.get(nm.toLowerCase()) || null;
+                        members.push({
+                            personId: pid,
+                            name: nm || (fromDom && fromDom.name) || '',
+                            presence: fromDom ? fromDom.presence : 'unknown',
+                            avatarDataUrl: fromDom ? fromDom.avatarDataUrl : '',
+                            initials: fromDom ? fromDom.initials : deriveInitials(nm),
+                            bg: fromDom ? fromDom.bg : nameColor(nm)
+                        });
+                    });
+                }
+            } catch (e) { /* fall through */ }
+        }
+        if (!members.length) {
+            // Fallback to pure DOM snapshot
+            const seen = new Set();
+            cache.byId.forEach(v => { seen.add(v.personId); members.push(v); });
+            cache.byName.forEach(v => {
+                if (v.personId && seen.has(v.personId)) return;
+                members.push(v);
+            });
+        }
+        // Dedup by personId || name
+        const uniq = new Map();
+        members.forEach(m => {
+            const k = m.personId || (m.name || '').toLowerCase();
+            if (!k) return;
+            const prev = uniq.get(k);
+            uniq.set(k, prev ? mergeProfile(prev, m) : m);
         });
-        return { group, members };
+        return Array.from(uniq.values());
     }
-
     function sortMembers(list) {
-        const isOnline = m => m.presence === 'available' || m.presence === 'do-not-disturb' || m.presence === 'away';
-        const online = list.filter(isOnline);
-        const offline = list.filter(m => !isOnline(m));
-        online.sort((a, b) => (PRESENCE_RANK[a.presence] - PRESENCE_RANK[b.presence]) || collator.compare(a.name, b.name));
-        offline.sort((a, b) => collator.compare(a.name, b.name));
-        return { online, offline };
+        return list.slice().sort((a, b) => {
+            const ra = PRESENCE_RANK[a.presence] ?? 99;
+            const rb = PRESENCE_RANK[b.presence] ?? 99;
+            if (ra !== rb) return ra - rb;
+            return collator.compare(a.name || '', b.name || '');
+        });
     }
 
-    function injectStyles(css) {
+    // ---------- 7. UI ----------
+    function injectStyles() {
         if (document.getElementById('__RCPW_STYLE__')) return;
         const s = document.createElement('style');
         s.id = '__RCPW_STYLE__';
-        s.textContent = css;
-        document.head.appendChild(s);
+        s.textContent = CSS;
+        document.documentElement.appendChild(s);
     }
-
-    function renderPanel(state) {
-        const panel = document.getElementById('__RCPW_PANEL__');
-        if (!panel) return;
-        const { members, presenceCoverage, loading } = state;
+    function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+    function renderAvatar(m) {
+        if (m.avatarDataUrl) {
+            return '<span class="av" style="background-image:url(' + m.avatarDataUrl + ')"><span class="pdot" style="background:' + PRESENCE_COLOR[m.presence] + '"></span></span>';
+        }
+        const bg = m.bg || nameColor(m.name);
+        return '<span class="av" style="background:' + bg + '">' + escapeHtml(m.initials || deriveInitials(m.name)) + '<span class="pdot" style="background:' + PRESENCE_COLOR[m.presence] + '"></span></span>';
+    }
+    function renderPanel(panel, members) {
+        const online = members.filter(m => m.presence === 'available');
+        const busy = members.filter(m => ['busy', 'doNotDisturb', 'inMeeting', 'onCall'].includes(m.presence));
+        const away = members.filter(m => m.presence === 'away');
+        const offline = members.filter(m => m.presence === 'offline' || m.presence === 'unknown');
         const total = members.length;
-        const { online, offline } = sortMembers(members);
-        const sub = loading
-            ? ('正在扫描… ' + (presenceCoverage || 0) + ' 已采集')
-            : ('共 ' + total + ' 人,在线 ' + online.length
-                + (presenceCoverage != null ? (' · presence 覆盖 ' + presenceCoverage + '/' + total) : ''));
-        panel.querySelector('.sub').textContent = sub;
-
-        const listEl = panel.querySelector('.list');
-        listEl.innerHTML = '';
-
-        const renderSec = (label, color, arr) => {
-            if (!arr.length) return;
-            const sec = document.createElement('div');
-            sec.className = 'sec';
-            const dot = document.createElement('span');
-            dot.className = 'dot';
-            dot.style.background = color;
-            sec.appendChild(dot);
-            sec.appendChild(document.createTextNode(' ' + label + ' (' + arr.length + ')'));
-            listEl.appendChild(sec);
-
-            arr.forEach(m => {
-                const row = document.createElement('div');
-                row.className = 'row';
-
-                const avatar = document.createElement('div');
-                avatar.className = 'avatar';
-                if (m.avatarDataUrl) {
-                    avatar.style.backgroundColor = m.color;
-                    avatar.style.backgroundImage = 'url("' + m.avatarDataUrl + '")';
-                    avatar.textContent = '';
-                } else {
-                    avatar.style.backgroundColor = m.color;
-                    avatar.textContent = m.initials;
-                }
-                const dot = document.createElement('span');
-                dot.className = 'p ' + m.presence;
-                avatar.appendChild(dot);
-
-                const meta = document.createElement('div');
-                meta.className = 'meta';
-                const nm = document.createElement('div');
-                nm.className = 'name';
-                nm.textContent = m.name;
-                const sg = document.createElement('div');
-                sg.className = 'sig' + (m.signature ? '' : ' empty');
-                sg.textContent = m.signature || '未设置签名';
-                meta.appendChild(nm);
-                meta.appendChild(sg);
-
-                row.appendChild(avatar);
-                row.appendChild(meta);
-                listEl.appendChild(row);
-            });
+        const covered = members.filter(m => m.presence !== 'unknown').length;
+        const head = panel.querySelector('.sub');
+        if (head) head.textContent = '共 ' + total + ' 人，在线 ' + online.length + ' · presence 覆盖 ' + covered + '/' + total;
+        const body = panel.querySelector('.body');
+        const renderSec = (label, color, list) => {
+            if (!list.length) return '';
+            const items = sortMembers(list).map(m => '<li>' + renderAvatar(m) + '<span class="nm" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name || '(未知)') + '</span></li>').join('');
+            return '<div class="sec"><h4><span class="dot" style="background:' + color + '"></span>' + label + ' (' + list.length + ')</h4><ul>' + items + '</ul></div>';
         };
-
-        renderSec('在线', '#2ecc71', online);
-        renderSec('离线 / 隐身', '#bfc3c8', offline);
+        let html = '';
+        html += renderSec('在线', '#2ecc71', online);
+        html += renderSec('忙碌 / 会议 / 通话', '#e67e22', busy);
+        html += renderSec('离开', '#f1c40f', away);
+        html += renderSec('离线 / 隐身', '#bdbdbd', offline);
+        if (!html) html = '<div class="empty">没有获取到成员，请确认已打开某个群组的成员列表。</div>';
+        body.innerHTML = html;
     }
 
     function buildPanel() {
@@ -460,58 +390,112 @@
         if (panel) return panel;
         panel = document.createElement('div');
         panel.id = '__RCPW_PANEL__';
-        panel.innerHTML =
-            '<div class="hdr">'
-            + '<div><h3>群成员在线一览<span class="ver">v1.3.0</span></h3><div class="sub">—</div></div>'
-            + '<button class="x" title="关闭">×</button>'
-            + '</div>'
-            + '<div class="bar">'
-            + '<button data-act="scan">🔄 扫描</button>'
-            + '<button data-act="quick">⚡ 快读</button>'
-            + '<span class="tip"></span>'
-            + '</div>'
-            + '<div class="list"></div>';
+        panel.innerHTML = [
+            '<div class="hdr">',
+            '  <div>',
+            '    <h3>群成员在线一览<span class="ver">v1.3.1</span></h3>',
+            '    <div class="sub">初始化中…</div>',
+            '  </div>',
+            '  <button class="x" title="关闭">×</button>',
+            '</div>',
+            '<div class="bar">',
+            '  <button data-act="scan" title="重新扫描当前可见成员">🔄 扫描</button>',
+            '  <button data-act="fast" title="快速读取（不滚动）">⚡ 快读</button>',
+            '  <span class="tip"></span>',
+            '</div>',
+            '<div class="body"><div class="empty">点击「扫描」开始。</div></div>',
+            '<div class="ft"><span>Anna\'s RCPW</span><span class="stat"></span></div>'
+        ].join('');
         document.body.appendChild(panel);
-        panel.style.display = 'none';
-        panel.querySelector('.x').onclick = () => { panel.style.display = 'none'; };
-        panel.querySelector('[data-act="scan"]').onclick = () => Controller.fullScan();
-        panel.querySelector('[data-act="quick"]').onclick = () => Controller.quickRead();
+        panel.querySelector('.x').addEventListener('click', () => Controller.hide());
+        panel.querySelector('[data-act="scan"]').addEventListener('click', () => Controller.scan());
+        panel.querySelector('[data-act="fast"]').addEventListener('click', () => Controller.scan({ fast: true }));
         return panel;
     }
-
     function buildFab() {
         let fab = document.getElementById('__RCPW_FAB__');
         if (fab) return fab;
         fab = document.createElement('div');
         fab.id = '__RCPW_FAB__';
         fab.title = '群成员在线一览';
-        fab.textContent = '👁️';
+        fab.textContent = '👁';
         document.body.appendChild(fab);
-        fab.onclick = () => {
-            const panel = buildPanel();
-            const shown = panel.style.display !== 'none';
-            panel.style.display = shown ? 'none' : 'flex';
-            if (!shown) Controller.quickRead();
-        };
+        fab.addEventListener('click', () => Controller.toggle());
         return fab;
     }
 
+    // ---------- 8. Controller ----------
     const Controller = {
-        _cache: { groupId: null, members: [], domById: new Map(), domByName: new Map() },
-        _state: { members: [], presenceCoverage: 0, loading: false },
-
-        _ensureGroupScope() {
-            const gid = currentGroupId();
-            if (gid !== this._cache.groupId) {
-                this._cache = { groupId: gid, members: [], domById: new Map(), domByName: new Map() };
-                this._state = { members: [], presenceCoverage: 0, loading: false };
-            }
-            return gid;
+        _visible: false,
+        show() {
+            const panel = buildPanel();
+            panel.style.display = 'flex';
+            this._visible = true;
+            this.scan({ fast: true });
         },
+        hide() {
+            const panel = document.getElementById('__RCPW_PANEL__');
+            if (panel) panel.style.display = 'none';
+            this._visible = false;
+        },
+        toggle() { this._visible ? this.hide() : this.show(); },
+        async scan(opts) {
+            opts = opts || {};
+            const panel = buildPanel();
+            const tip = panel.querySelector('.tip');
+            const stat = panel.querySelector('.stat');
+            tip.textContent = opts.fast ? '快读中…' : '扫描中…';
+            try {
+                AutoCollector._snapshotNow();
+                const members = await aggregate();
+                renderPanel(panel, members);
+                const covered = members.filter(m => m.presence !== 'unknown').length;
+                stat.textContent = '已覆盖 ' + covered + '/' + members.length;
+                tip.textContent = new Date().toLocaleTimeString();
+            } catch (e) {
+                WARN('scan failed', e);
+                tip.textContent = '失败：' + (e && e.message || e);
+            }
+        }
+    };
 
-        _mergeDom(snapshot) {
-            snapshot.byId.forEach((v, k) => {
-                const prev = this._cache.domById.get(k);
-                if (!prev) { this._cache.domById.set(k, v); return; }
-                const better =
-                    PRES
+    // ---------- 9. SPA hooks ----------
+    (function hookSpa() {
+        const push = history.pushState;
+        const replace = history.replaceState;
+        const fire = () => window.dispatchEvent(new Event('__rcpw_locchange__'));
+        history.pushState = function () { const r = push.apply(this, arguments); fire(); return r; };
+        history.replaceState = function () { const r = replace.apply(this, arguments); fire(); return r; };
+        window.addEventListener('popstate', fire);
+        window.addEventListener('__rcpw_locchange__', () => {
+            // On navigation, clear DOM-cache to avoid cross-group pollution
+            AutoCollector.reset();
+            if (Controller._visible) setTimeout(() => Controller.scan({ fast: true }), 600);
+        });
+    })();
+
+    // ---------- 10. boot ----------
+    async function boot() {
+        injectStyles();
+        // Wait for the main RC app to render
+        for (let i = 0; i < 40; i++) {
+            if (document.body && document.querySelector('[data-test-automation-id]')) break;
+            await sleep(500);
+        }
+        injectStyles();
+        buildFab();
+        AutoCollector.start();
+        LOG('ready v1.3.1');
+    }
+    boot();
+
+    // Expose minimal debug hooks
+    window.__RCPW__ = {
+        show: () => Controller.show(),
+        hide: () => Controller.hide(),
+        scan: (o) => Controller.scan(o),
+        snapshot: () => snapshotFromDom(),
+        cache: () => AutoCollector.cache,
+        version: '1.3.1'
+    };
+})();
