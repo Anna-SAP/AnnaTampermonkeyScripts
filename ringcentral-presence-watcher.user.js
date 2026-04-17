@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         RingCentral Group Member Watcher (群成员在线一览)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.3.1
-// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组成员的真实头像与在线状态。v1.3.1 修复 styled-components 哈希类名导致 presence 无法识别、以及头像只显示缩写的问题；改用 data-test-automation-id 锚点与 canvas.toDataURL 捕获真实头像。
+// @version      1.3.2
+// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组成员的真实头像与在线状态。v1.3.2 修复成员名称全部显示“未知”的问题：改以头像按钮（data-test-automation-class=avatar, data-uid=GLIP_PERSON.*）为行锚点，名称从 aria-label 解析，背景色从 .RcAvatar-avatarContainer 读取。
 // @author       Anna Su
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -63,14 +63,13 @@
         return 'hsl(' + hue + ',55%,55%)';
     }
 
-    // ---------- 2. Glip IndexedDB (best-effort; used to seed member list by group id) ----------
+    // ---------- 2. Glip IndexedDB ----------
     const GlipDB = (() => {
         let dbPromise = null;
         function open() {
             if (dbPromise) return dbPromise;
             dbPromise = new Promise((resolve, reject) => {
                 try {
-                    // Find the Glip DB name: RingCentral stores it as "glip_*"
                     const req = indexedDB.databases ? indexedDB.databases() : Promise.resolve([]);
                     Promise.resolve(req).then(list => {
                         const glip = (list || []).find(d => /glip/i.test(d.name || ''));
@@ -83,18 +82,7 @@
             }).catch(err => { dbPromise = null; throw err; });
             return dbPromise;
         }
-        function tx(db, store) {
-            return db.transaction(store, 'readonly').objectStore(store);
-        }
-        function getAll(store) {
-            return open().then(db => new Promise((resolve, reject) => {
-                try {
-                    const r = tx(db, store).getAll();
-                    r.onsuccess = () => resolve(r.result || []);
-                    r.onerror = () => reject(r.error);
-                } catch (e) { reject(e); }
-            })).catch(() => []);
-        }
+        function tx(db, store) { return db.transaction(store, 'readonly').objectStore(store); }
         function get(store, key) {
             return open().then(db => new Promise((resolve, reject) => {
                 try {
@@ -115,7 +103,7 @@
                 })));
             }).catch(() => ids.map(() => null));
         }
-        return { open, getAll, get, getGroup, getPersonsByIds };
+        return { open, get, getGroup, getPersonsByIds };
     })();
 
     // ---------- 3. presence ----------
@@ -123,13 +111,13 @@
     function normalizePresence(tok) {
         if (!tok) return 'unknown';
         const s = String(tok).toLowerCase();
-        if (/\bavailable\b|online/.test(s)) return 'available';
         if (/donotdisturb|do-not-disturb|do_not_disturb|\bdnd\b/.test(s)) return 'doNotDisturb';
         if (/inmeeting|in-meeting|in_meeting|meeting/.test(s)) return 'inMeeting';
-        if (/oncall|on-call|on_call|\bcall\b/.test(s)) return 'onCall';
+        if (/oncall|on-call|on_call|\bon a call\b/.test(s)) return 'onCall';
         if (/\bbusy\b/.test(s)) return 'busy';
         if (/\baway\b|idle/.test(s)) return 'away';
         if (/offline|invisible|unavailable/.test(s)) return 'offline';
+        if (/\bavailable\b|online/.test(s)) return 'available';
         return 'unknown';
     }
     const PRESENCE_COLOR = {
@@ -137,100 +125,102 @@
         inMeeting: '#9b59b6', onCall: '#e74c3c', away: '#f1c40f',
         offline: '#bdbdbd', unknown: '#bdbdbd'
     };
-    const PRESENCE_LABEL = {
-        available: '在线', busy: '忙碌', doNotDisturb: '勿扰',
-        inMeeting: '会议中', onCall: '通话中', away: '离开',
-        offline: '离线', unknown: '未知'
-    };
     function betterPresence(a, b) {
         const ra = PRESENCE_RANK[a] ?? 99, rb = PRESENCE_RANK[b] ?? 99;
         return ra <= rb ? a : b;
     }
 
     // ---------- 4. DOM snapshot ----------
-    // Each member row in both the right-side panel and the members dialog
-    // renders a presence pill with:
-    //   [data-test-automation-id="presence"][data-id="GLIP_PERSON.<id>"]
-    //     type="available|unavailable|doNotDisturb|inMeeting|onCall|..."
-    //     title="Available|Offline|Busy|Do not disturb|In a meeting|On a call|..."
-    // Avatars are either <canvas> (real image) or <span class="avatar-short-name"> (initials).
-    function captureCanvasAvatar(row) {
+    // The row anchor is the avatar BUTTON itself:
+    //   [data-test-automation-class="avatar"][data-uid^="GLIP_PERSON."]
+    //   - aria-label starts with the display name, e.g. "Abhijit Padhy, mini profile. ..."
+    //   - contains a nested [data-test-automation-id="presence"] with type/title
+    //   - contains either a <canvas> (real avatar) or .avatar-short-name inside .RcAvatar-avatarContainer (colored bg)
+    // We exclude topBar avatars and conversation-list chat avatars because those are not group members.
+    function parseNameFromAriaLabel(label) {
+        if (!label) return '';
+        // Common patterns:
+        //  "Jane Doe, mini profile. Press Enter to view ..."
+        //  "Jane Doe mini profile"  (some variants)
+        //  "Jane Doe"
+        const cut = label.split(',')[0];
+        return cut.replace(/\b(mini profile|profile|avatar)\b.*$/i, '').trim();
+    }
+    function captureCanvas(scope) {
         try {
-            const cvs = row.querySelector('.RcAvatar-avatarContainer canvas, canvas');
+            const cvs = scope.querySelector('canvas');
             if (!cvs || !cvs.width || !cvs.height) return '';
             return cvs.toDataURL('image/png');
         } catch (e) { return ''; }
     }
-    function readShortNameNode(row) {
-        return row.querySelector('.avatar-short-name, .RcAvatar-short-name, [class*="short-name"]');
-    }
-    function readRowProfile(row) {
-        const presenceEl = row.querySelector('[data-test-automation-id="presence"][data-id^="GLIP_PERSON"]')
-            || row.querySelector('[data-test-automation-id="presence"]');
-        let personId = null, presence = 'unknown';
+    function readAvatarButton(btn) {
+        const uid = btn.getAttribute('data-uid') || btn.getAttribute('data-cid') || '';
+        const m = uid.match(/GLIP_PERSON\.(\d+)/);
+        if (!m) return null;
+        const personId = m[1];
+        const name = parseNameFromAriaLabel(btn.getAttribute('aria-label') || '');
+        // presence
+        const presenceEl = btn.querySelector('[data-test-automation-id="presence"]');
+        let presence = 'unknown';
         if (presenceEl) {
-            const did = presenceEl.getAttribute('data-id') || '';
-            const m = did.match(/GLIP_PERSON\.(\d+)/);
-            if (m) personId = m[1];
             const type = presenceEl.getAttribute('type') || '';
             const title = presenceEl.getAttribute('title') || '';
-            presence = normalizePresence(type) !== 'unknown'
-                ? normalizePresence(type)
-                : normalizePresence(title);
+            presence = normalizePresence(type);
+            if (presence === 'unknown') presence = normalizePresence(title);
         }
-        // Name
-        let name = '';
-        const nameEl = row.querySelector('[data-test-automation-id*="name"], .name, [class*="Name"]');
-        if (nameEl && nameEl.textContent) name = nameEl.textContent.trim();
-        if (!name) {
-            // Fallback: take the longest text node in the row
-            const txt = row.textContent.trim().split(/\n+/).map(s => s.trim()).filter(Boolean);
-            if (txt.length) name = txt[0];
-        }
-        // Avatar
-        const dataUrl = captureCanvasAvatar(row);
+        // avatar: canvas preferred; else short-name + container bg
+        const avatarDataUrl = captureCanvas(btn);
         let initials = '', bg = '';
-        if (!dataUrl) {
-            const sn = readShortNameNode(row);
+        if (!avatarDataUrl) {
+            const sn = btn.querySelector('.avatar-short-name, [class*="short-name"]');
             if (sn) {
                 initials = (sn.textContent || '').trim();
-                const cs = getComputedStyle(sn);
-                bg = cs.backgroundColor || cs.background || '';
+                const container = sn.closest('[class*="RcAvatar-avatarContainer"]') || sn.parentElement;
+                if (container) {
+                    const cs = getComputedStyle(container);
+                    const c = cs.backgroundColor;
+                    if (c && !/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/i.test(c) && c !== 'transparent') bg = c;
+                }
             }
         }
         if (!initials) initials = deriveInitials(name);
         if (!bg) bg = nameColor(name);
-        return { personId, name, presence, avatarDataUrl: dataUrl, initials, bg };
+        return { personId, name, presence, avatarDataUrl, initials, bg };
+    }
+    function isGroupMemberAvatar(btn) {
+        // Accept right-shelf team member list avatars and any Members dialog rows
+        const tid = btn.getAttribute('data-test-automation-id') || '';
+        if (tid === 'rightShelfMemberListAvatar') return true;
+        // Exclude obvious non-member surfaces
+        if (tid === 'topBarAvatar') return false;
+        // Conversation list item avatars: inside .conversation-list-item
+        if (btn.closest('.conversation-list-item, [data-test-automation-id*="conversation"]')) return false;
+        // Message sender avatars in chat stream
+        if (btn.closest('[data-test-automation-id*="message"]')) return false;
+        // Mini profile / hover cards – exclude
+        if (btn.closest('[role="dialog"] [class*="profile"], [class*="miniProfile"], [class*="MiniProfile"]')) return false;
+        // Members dialog (team settings) – keep
+        if (btn.closest('[data-test-automation-id*="MemberItem"], [data-test-automation-id*="member-item"], [data-test-automation-id*="teamMember"]')) return true;
+        // Default: accept if it sits inside a members list region
+        if (btn.closest('[data-test-automation-id*="MemberList"], [data-test-automation-id*="memberList"], [data-test-automation-id*="Members"]')) return true;
+        return false;
     }
     function snapshotFromDom() {
         const byId = new Map();
         const byName = new Map();
-        // Members dialog rows
-        const rows = new Set();
-        // Group chat members dialog rows
-        $$('[data-test-automation-id="team-member-item"], [data-test-automation-id*="member-item"], [data-test-automation-id*="MemberItem"]').forEach(r => rows.add(r));
-        // Right-side team members list
-        $$('[data-test-automation-id="presence"][data-id^="GLIP_PERSON"]').forEach(p => {
-            // Walk up to the visible row container
-            let el = p, hops = 0;
-            while (el && hops < 8) {
-                if (el.offsetHeight >= 28) { rows.add(el); break; }
-                el = el.parentElement; hops++;
-            }
-        });
-        rows.forEach(row => {
-            const prof = readRowProfile(row);
+        const btns = document.querySelectorAll('[data-test-automation-class="avatar"][data-uid^="GLIP_PERSON"]');
+        btns.forEach(b => {
+            if (!isGroupMemberAvatar(b)) return;
+            const prof = readAvatarButton(b);
             if (!prof) return;
             if (prof.personId) {
                 const prev = byId.get(prof.personId);
-                if (!prev) byId.set(prof.personId, prof);
-                else byId.set(prof.personId, mergeProfile(prev, prof));
+                byId.set(prof.personId, prev ? mergeProfile(prev, prof) : prof);
             }
             if (prof.name) {
                 const k = prof.name.toLowerCase();
                 const prev = byName.get(k);
-                if (!prev) byName.set(k, prof);
-                else byName.set(k, mergeProfile(prev, prof));
+                byName.set(k, prev ? mergeProfile(prev, prof) : prof);
             }
         });
         return { byId, byName };
@@ -256,7 +246,7 @@
         });
     }
 
-    // ---------- 5. Auto collector: observes DOM for member rows appearing ----------
+    // ---------- 5. Auto collector ----------
     const AutoCollector = {
         _observer: null,
         _cache: { byId: new Map(), byName: new Map() },
@@ -282,7 +272,7 @@
         get cache() { return this._cache; }
     };
 
-    // ---------- 6. current group / aggregation ----------
+    // ---------- 6. aggregation ----------
     function currentGroupId() {
         const m = location.pathname.match(/\/messages?\/(\d+)/);
         return m ? m[1] : null;
@@ -299,24 +289,22 @@
                 if (ids.length) {
                     const people = await GlipDB.getPersonsByIds(ids);
                     people.forEach((p, i) => {
-                        if (!p) { members.push({ personId: String(ids[i]), name: '', presence: 'unknown' }); return; }
-                        const pid = String(p.id || ids[i]);
-                        const nm = (p.display_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email || '').trim();
-                        const fromDom = cache.byId.get(pid) || cache.byName.get(nm.toLowerCase()) || null;
+                        const pid = String((p && p.id) || ids[i]);
+                        const nm = p ? (p.display_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email || '').trim() : '';
+                        const fromDom = cache.byId.get(pid) || (nm && cache.byName.get(nm.toLowerCase())) || null;
                         members.push({
                             personId: pid,
                             name: nm || (fromDom && fromDom.name) || '',
                             presence: fromDom ? fromDom.presence : 'unknown',
                             avatarDataUrl: fromDom ? fromDom.avatarDataUrl : '',
-                            initials: fromDom ? fromDom.initials : deriveInitials(nm),
-                            bg: fromDom ? fromDom.bg : nameColor(nm)
+                            initials: (fromDom && fromDom.initials) || deriveInitials(nm),
+                            bg: (fromDom && fromDom.bg) || nameColor(nm)
                         });
                     });
                 }
             } catch (e) { /* fall through */ }
         }
         if (!members.length) {
-            // Fallback to pure DOM snapshot
             const seen = new Set();
             cache.byId.forEach(v => { seen.add(v.personId); members.push(v); });
             cache.byName.forEach(v => {
@@ -324,7 +312,6 @@
                 members.push(v);
             });
         }
-        // Dedup by personId || name
         const uniq = new Map();
         members.forEach(m => {
             const k = m.personId || (m.name || '').toLowerCase();
@@ -393,7 +380,7 @@
         panel.innerHTML = [
             '<div class="hdr">',
             '  <div>',
-            '    <h3>群成员在线一览<span class="ver">v1.3.1</span></h3>',
+            '    <h3>群成员在线一览<span class="ver">v1.3.2</span></h3>',
             '    <div class="sub">初始化中…</div>',
             '  </div>',
             '  <button class="x" title="关闭">×</button>',
@@ -468,7 +455,6 @@
         history.replaceState = function () { const r = replace.apply(this, arguments); fire(); return r; };
         window.addEventListener('popstate', fire);
         window.addEventListener('__rcpw_locchange__', () => {
-            // On navigation, clear DOM-cache to avoid cross-group pollution
             AutoCollector.reset();
             if (Controller._visible) setTimeout(() => Controller.scan({ fast: true }), 600);
         });
@@ -477,7 +463,6 @@
     // ---------- 10. boot ----------
     async function boot() {
         injectStyles();
-        // Wait for the main RC app to render
         for (let i = 0; i < 40; i++) {
             if (document.body && document.querySelector('[data-test-automation-id]')) break;
             await sleep(500);
@@ -485,17 +470,16 @@
         injectStyles();
         buildFab();
         AutoCollector.start();
-        LOG('ready v1.3.1');
+        LOG('ready v1.3.2');
     }
     boot();
 
-    // Expose minimal debug hooks
     window.__RCPW__ = {
         show: () => Controller.show(),
         hide: () => Controller.hide(),
         scan: (o) => Controller.scan(o),
         snapshot: () => snapshotFromDom(),
         cache: () => AutoCollector.cache,
-        version: '1.3.1'
+        version: '1.3.2'
     };
 })();
