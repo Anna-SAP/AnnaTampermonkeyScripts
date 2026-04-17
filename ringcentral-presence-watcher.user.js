@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         RingCentral Group Member Watcher (群成员在线一览)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.2.0
-// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组成员的在线状态与个性签名。v1.2.0 改用 IndexedDB(Glip) + DOM presence 快照 + 程序化自动滚动，覆盖全员。
+// @version      1.2.1
+// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组成员的在线状态与个性签名。v1.2.1 用首字母彩色头像取代 /file-service URL（该端点需要 RC 内部鉴权，外部加载失败）。
 // @author       Anna Su
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -31,7 +31,7 @@
         "#__RCPW_PANEL__ .sec .dot{width:8px;height:8px;border-radius:50%}",
         "#__RCPW_PANEL__ .row{display:flex;gap:10px;padding:10px 14px;border-bottom:1px solid #f3f3f3;align-items:center}",
         "#__RCPW_PANEL__ .row:hover{background:#fafafa}",
-        "#__RCPW_PANEL__ .avatar{width:40px;height:40px;border-radius:50%;background:#ddd;background-size:cover;background-position:center;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:15px}",
+        "#__RCPW_PANEL__ .avatar{width:40px;height:40px;border-radius:50%;background:#bbb;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:14px;letter-spacing:.5px}",
         "#__RCPW_PANEL__ .avatar .p{position:absolute;right:-1px;bottom:-1px;width:12px;height:12px;border-radius:50%;border:2px solid #fff;background:#bbb}",
         "#__RCPW_PANEL__ .avatar .p.available{background:#2ecc71}",
         "#__RCPW_PANEL__ .avatar .p.do-not-disturb{background:#e74c3c}",
@@ -50,6 +50,21 @@
     const $ = (sel, root) => (root || document).querySelector(sel);
     const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
     const collator = new Intl.Collator(['zh-Hans', 'en'], { sensitivity: 'base', numeric: true });
+
+    // ---------- Avatar helpers (NEW in v1.2.1) ----------
+    function deriveInitials(name) {
+        if (!name) return '?';
+        const t = name.trim();
+        if (/^[\u4e00-\u9fa5]/.test(t)) return t[0];
+        const words = t.split(/\s+/).filter(Boolean);
+        if (words.length === 1) return (words[0][0] || '?').toUpperCase();
+        return ((words[0][0] || '') + (words[words.length - 1][0] || '')).toUpperCase();
+    }
+    function nameColor(name) {
+        let h = 0;
+        for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+        return 'hsl(' + (h % 360) + ', 55%, 52%)';
+    }
 
     // ---------- GlipDB ----------
     const GlipDB = (function () {
@@ -119,17 +134,6 @@
         }
         return { open, getAll, get, getGroup, getPersonsByIds };
     })();
-
-    function headshotUrl(person) {
-        if (!person) return '';
-        const h = person.headshot;
-        if (!h) return '';
-        if (typeof h === 'string') return h;
-        const fid = h.stored_file_id || h.storedFileId;
-        const cid = h.creator_id || h.creatorId || person.id;
-        if (fid && cid) return 'https://app.ringcentral.com/file-service/creator/' + cid + '/file/' + fid + '/data?thumbnail=true';
-        return h.url || '';
-    }
 
     const PRESENCE_RANK = { 'available': 1, 'do-not-disturb': 2, 'away': 3, 'invisible': 4, 'offline': 5, 'unknown': 6 };
     function classifyPresence(iconEl) {
@@ -215,11 +219,11 @@
             return {
                 id: p.id,
                 name,
-                avatar: headshotUrl(p),
                 presence: presenceMap.get(key) || 'unknown',
                 signature: (p.headline || p.away_status || '').trim(),
                 awayStatusUpdatedAt: p.away_status_updated_at || 0,
-                initials: ((p.first_name || name)[0] || '?').toUpperCase()
+                initials: deriveInitials(name),
+                color: nameColor(name)
             };
         });
         return { group, members };
@@ -264,8 +268,8 @@
             arr.forEach(m => {
                 const row = document.createElement('div'); row.className = 'row';
                 const avatar = document.createElement('div'); avatar.className = 'avatar';
-                if (m.avatar) { avatar.style.backgroundImage = 'url("' + m.avatar.replace(/"/g, '%22') + '")'; }
-                else { avatar.textContent = m.initials || '?'; avatar.style.background = '#ff7a00'; }
+                avatar.style.background = m.color || nameColor(m.name);
+                avatar.textContent = m.initials || deriveInitials(m.name);
                 const p = document.createElement('span'); p.className = 'p ' + m.presence; avatar.appendChild(p);
                 const meta = document.createElement('div'); meta.className = 'meta';
                 const nm = document.createElement('div'); nm.className = 'name'; nm.textContent = m.name;
@@ -286,7 +290,7 @@
         panel.id = '__RCPW_PANEL__';
         panel.innerHTML =
             '<div class="hdr">' +
-            '<div><h3>群成员在线一览<span class="ver">v1.2.0</span></h3><div class="sub">—</div></div>' +
+            '<div><h3>群成员在线一览<span class="ver">v1.2.1</span></h3><div class="sub">—</div></div>' +
             '<button class="x" title="关闭">×</button>' +
             '</div>' +
             '<div class="bar">' +
@@ -379,7 +383,7 @@
         injectStyles(CSS);
         buildFab();
         buildPanel();
-        LOG('v1.2.0 ready. Group =', currentGroupId());
+        LOG('v1.2.1 ready. Group =', currentGroupId());
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
     else boot();
