@@ -1,556 +1,389 @@
 // ==UserScript==
 // @name         RingCentral Group Member Watcher (群成员在线一览)
-// @namespace    https://github.com/your-name/rc-watcher
-// @version      1.0.0
-// @description  在 RingCentral 网页版中注入一个悬浮"大眼睛"按钮,一键查看当前群组成员的在线状态与个性签名,在线优先置顶,并按状态更新时间排序。
-// @author       You
+// @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
+// @version      1.2.0
+// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组成员的在线状态与个性签名。v1.2.0 改用 IndexedDB(Glip) + DOM presence 快照 + 程序化自动滚动，覆盖全员。
+// @author       Anna Su
 // @match        https://app.ringcentral.com/*
-// @match        https://*.ringcentral.com/*
-// @grant        GM_addStyle
-// @grant        unsafeWindow
-// @run-at       document-idle
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
+// @grant        none
+// @run-at       document-end
+// @updateURL    https://raw.githubusercontent.com/Anna-SAP/AnnaTampermonkeyScripts/main/ringcentral-presence-watcher.user.js
+// @downloadURL  https://raw.githubusercontent.com/Anna-SAP/AnnaTampermonkeyScripts/main/ringcentral-presence-watcher.user.js
 // ==/UserScript==
-
 (function () {
+    // ---------- 0. CSS ----------
+    const CSS = [
+        "#__RCPW_FAB__{position:fixed;right:22px;bottom:22px;width:54px;height:54px;border-radius:50%;background:#ff7a00;color:#fff;display:flex;align-items:center;justify-content:center;font-size:26px;cursor:pointer;box-shadow:0 6px 20px rgba(255,122,0,.45);z-index:2147483000;transition:transform .15s ease;user-select:none}",
+        "#__RCPW_FAB__:hover{transform:scale(1.08)}",
+        "#__RCPW_PANEL__{position:fixed;right:22px;bottom:90px;width:360px;max-height:70vh;background:#fff;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.22);z-index:2147483001;display:flex;flex-direction:column;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#222}",
+        "#__RCPW_PANEL__ .hdr{background:#ff7a00;color:#fff;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between}",
+        "#__RCPW_PANEL__ .hdr h3{margin:0;font-size:16px;font-weight:600}",
+        "#__RCPW_PANEL__ .hdr .ver{opacity:.85;font-weight:400;font-size:12px;margin-left:6px}",
+        "#__RCPW_PANEL__ .hdr .sub{font-size:12px;opacity:.9;margin-top:4px}",
+        "#__RCPW_PANEL__ .hdr .x{background:transparent;border:0;color:#fff;font-size:20px;cursor:pointer;line-height:1}",
+        "#__RCPW_PANEL__ .bar{display:flex;gap:8px;padding:10px 12px;border-bottom:1px solid #eee;align-items:center}",
+        "#__RCPW_PANEL__ .bar button{border:1px solid #e3e3e3;background:#fafafa;padding:6px 10px;border-radius:8px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:4px}",
+        "#__RCPW_PANEL__ .bar button:hover{background:#f0f0f0}",
+        "#__RCPW_PANEL__ .bar .tip{flex:1;text-align:right;font-size:11px;color:#888}",
+        "#__RCPW_PANEL__ .list{overflow-y:auto;flex:1}",
+        "#__RCPW_PANEL__ .sec{padding:8px 14px;font-size:12px;font-weight:600;color:#ff7a00;background:#fff7ee;display:flex;align-items:center;gap:6px}",
+        "#__RCPW_PANEL__ .sec .dot{width:8px;height:8px;border-radius:50%}",
+        "#__RCPW_PANEL__ .row{display:flex;gap:10px;padding:10px 14px;border-bottom:1px solid #f3f3f3;align-items:center}",
+        "#__RCPW_PANEL__ .row:hover{background:#fafafa}",
+        "#__RCPW_PANEL__ .avatar{width:40px;height:40px;border-radius:50%;background:#ddd;background-size:cover;background-position:center;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:15px}",
+        "#__RCPW_PANEL__ .avatar .p{position:absolute;right:-1px;bottom:-1px;width:12px;height:12px;border-radius:50%;border:2px solid #fff;background:#bbb}",
+        "#__RCPW_PANEL__ .avatar .p.available{background:#2ecc71}",
+        "#__RCPW_PANEL__ .avatar .p.do-not-disturb{background:#e74c3c}",
+        "#__RCPW_PANEL__ .avatar .p.away{background:#f1c40f}",
+        "#__RCPW_PANEL__ .avatar .p.invisible,#__RCPW_PANEL__ .avatar .p.offline,#__RCPW_PANEL__ .avatar .p.unknown{background:#bbb}",
+        "#__RCPW_PANEL__ .meta{flex:1;min-width:0}",
+        "#__RCPW_PANEL__ .name{font-size:14px;font-weight:600;color:#222;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+        "#__RCPW_PANEL__ .sig{font-size:12px;color:#888;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+        "#__RCPW_PANEL__ .sig.empty{color:#bbb;font-style:italic}"
+    ].join("\n");
+
     'use strict';
+    const LOG = (...a) => console.log('%c[RCPW]', 'color:#ff7a00;font-weight:bold', ...a);
+    const WARN = (...a) => console.warn('[RCPW]', ...a);
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const $ = (sel, root) => (root || document).querySelector(sel);
+    const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+    const collator = new Intl.Collator(['zh-Hans', 'en'], { sensitivity: 'base', numeric: true });
 
-    /* =========================================================
-     * 0. 全局配置 (Selectors & Constants)
-     *    ⚠️ 企业级 SPA 大量使用混淆类名 (如 .css-1a2b3c)。
-     *    以下选择器尽量使用 aria-*, data-*, role 等语义化属性,
-     *    若未来 RingCentral 改版失效,请优先修改此处常量即可。
-     * ========================================================= */
-    const SELECTORS = {
-        // 群组成员列表容器(侧边栏 People 区或 @mention 列表)
-        // RC 的群组成员信息常通过 "People" Tab 或 header 的成员头像堆加载
-        memberListRoot: [
-            '[data-test-automation-id="conversationHeader"]',
-            '[aria-label*="member" i]',
-            '[data-sign="conversationMemberList"]',
-            '[class*="MemberList"]',
-            '[class*="memberList"]'
-        ],
-        // 单个成员节点的候选选择器
-        memberItem: [
-            '[data-test-automation-id="memberItem"]',
-            '[data-sign="memberItem"]',
-            '[role="listitem"]',
-            'li[class*="Member"]',
-            'div[class*="MemberItem"]'
-        ],
-        // 头像 <img> 或带 background-image 的占位
-        avatar: [
-            'img[alt]',
-            '[class*="avatar" i] img',
-            '[data-sign="avatar"] img',
-            '[class*="Avatar"]'
-        ],
-        // 姓名
-        name: [
-            '[data-test-automation-id*="name" i]',
-            '[class*="name" i]',
-            '[class*="Name"]'
-        ],
-        // 在线状态圆点 (Available=绿, DND=红, Invisible/Offline=灰)
-        // 原生 presence 指示器一般绑在头像容器的右下角
-        presence: [
-            '[data-test-automation-id="presenceIndicator"]',
-            '[data-sign="presence"]',
-            '[class*="presence" i]',
-            '[aria-label*="Available" i]',
-            '[aria-label*="Do not disturb" i]',
-            '[aria-label*="Invisible" i]',
-            '[aria-label*="Offline" i]'
-        ],
-        // 状态消息(签名)
-        statusMessage: [
-            '[data-test-automation-id="statusMessage"]',
-            '[class*="statusMessage" i]',
-            '[class*="StatusMessage"]',
-            '[aria-label*="status message" i]'
-        ]
-    };
-
-    const PRESENCE_MAP = {
-        available: { color: '#06ac38', label: 'Available', rank: 0 },
-        busy:      { color: '#ff5c5c', label: 'Busy',      rank: 1 },
-        dnd:       { color: '#ff5c5c', label: 'Do not disturb', rank: 1 },
-        away:      { color: '#ffa500', label: 'Away',      rank: 2 },
-        invisible: { color: '#a8a8a8', label: 'Invisible', rank: 3 },
-        offline:   { color: '#a8a8a8', label: 'Offline',   rank: 3 },
-        unknown:   { color: '#cccccc', label: 'Unknown',   rank: 4 }
-    };
-
-    /* =========================================================
-     * 1. 样式注入模块 (Style Module)
-     * ========================================================= */
-    const STYLE = `
-    #rcw-fab {
-        position: fixed;
-        right: 28px;
-        bottom: 110px;
-        width: 52px;
-        height: 52px;
-        border-radius: 50%;
-        background: linear-gradient(135deg, #ff8a00, #ff5e00);
-        color: #fff;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 26px;
-        cursor: pointer;
-        box-shadow: 0 6px 18px rgba(255,94,0,.45), 0 2px 6px rgba(0,0,0,.12);
-        z-index: 2147483646;
-        user-select: none;
-        transition: transform .2s ease, box-shadow .2s ease;
-    }
-    #rcw-fab:hover { transform: scale(1.08); box-shadow: 0 10px 24px rgba(255,94,0,.55); }
-    #rcw-fab:active { transform: scale(.96); }
-
-    #rcw-panel {
-        position: fixed;
-        right: 28px;
-        bottom: 175px;
-        width: 360px;
-        max-height: 70vh;
-        background: #fff;
-        border-radius: 14px;
-        box-shadow: 0 12px 40px rgba(0,0,0,.18), 0 2px 6px rgba(0,0,0,.06);
-        z-index: 2147483647;
-        display: none;
-        flex-direction: column;
-        overflow: hidden;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-        animation: rcw-pop .18s ease-out;
-    }
-    #rcw-panel.open { display: flex; }
-    @keyframes rcw-pop {
-        from { opacity: 0; transform: translateY(8px) scale(.98); }
-        to   { opacity: 1; transform: translateY(0) scale(1); }
-    }
-    .rcw-head {
-        padding: 12px 16px;
-        background: linear-gradient(135deg, #ff8a00, #ff5e00);
-        color: #fff;
-        font-weight: 600;
-        font-size: 15px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .rcw-head .rcw-sub { font-weight: 400; font-size: 12px; opacity: .85; }
-    .rcw-head .rcw-close {
-        cursor: pointer; font-size: 18px; line-height: 1;
-        padding: 2px 6px; border-radius: 4px;
-    }
-    .rcw-head .rcw-close:hover { background: rgba(255,255,255,.2); }
-
-    .rcw-toolbar {
-        padding: 8px 12px;
-        border-bottom: 1px solid #eee;
-        display: flex;
-        gap: 8px;
-        align-items: center;
-        font-size: 12px;
-        color: #555;
-    }
-    .rcw-toolbar button {
-        border: 1px solid #ddd;
-        background: #fff;
-        padding: 4px 10px;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 12px;
-    }
-    .rcw-toolbar button:hover { background: #fafafa; }
-
-    .rcw-list {
-        overflow-y: auto;
-        flex: 1;
-        padding: 4px 0;
-    }
-    .rcw-item {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 10px 14px;
-        border-bottom: 1px solid #f2f2f2;
-        transition: background .15s;
-    }
-    .rcw-item:hover { background: #fff6ef; }
-    .rcw-avatar-wrap {
-        position: relative;
-        width: 40px;
-        height: 40px;
-        flex-shrink: 0;
-    }
-    .rcw-avatar {
-        width: 40px; height: 40px;
-        border-radius: 50%;
-        background: #e6e6e6 center/cover no-repeat;
-        display: flex; align-items: center; justify-content: center;
-        color: #fff; font-weight: 600; font-size: 14px;
-    }
-    .rcw-dot {
-        position: absolute;
-        right: -1px; bottom: -1px;
-        width: 12px; height: 12px;
-        border-radius: 50%;
-        border: 2px solid #fff;
-        box-sizing: content-box;
-    }
-    .rcw-info { flex: 1; min-width: 0; }
-    .rcw-name {
-        font-size: 14px; font-weight: 600; color: #222;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    }
-    .rcw-status {
-        font-size: 12px; color: #777;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-        margin-top: 2px;
-    }
-    .rcw-status.empty { color: #bbb; font-style: italic; }
-    .rcw-empty {
-        padding: 30px 20px;
-        text-align: center;
-        color: #999;
-        font-size: 13px;
-    }
-    .rcw-section-label {
-        font-size: 11px; font-weight: 600;
-        color: #ff5e00; text-transform: uppercase;
-        padding: 8px 14px 4px; letter-spacing: .5px;
-    }
-    `;
-    (typeof GM_addStyle === 'function')
-        ? GM_addStyle(STYLE)
-        : (function () {
-            const s = document.createElement('style');
-            s.textContent = STYLE; document.head.appendChild(s);
-        })();
-
-    /* =========================================================
-     * 2. 数据抓取模块 (Scraper Module)
-     *    策略: 优先从 RC 内置 Redux store (若可访问) 拉取;
-     *    兜底: 扫描 DOM 节点,按 aria-label/alt 判定在线状态。
-     * ========================================================= */
-    const Scraper = {
-        /** 尝试从多个候选选择器找到第一个匹配元素 */
-        queryFirst(root, candidates) {
-            for (const sel of candidates) {
-                const el = root.querySelector(sel);
-                if (el) return el;
-            }
-            return null;
-        },
-        queryAll(root, candidates) {
-            const out = [];
-            for (const sel of candidates) {
-                root.querySelectorAll(sel).forEach(n => out.push(n));
-            }
-            return out;
-        },
-
-        /** 根据 aria-label / class 关键字推断在线状态 key */
-        detectPresence(el) {
-            if (!el) return 'unknown';
-            const text = [
-                el.getAttribute && el.getAttribute('aria-label'),
-                el.getAttribute && el.getAttribute('title'),
-                el.getAttribute && el.getAttribute('data-presence'),
-                el.className && String(el.className)
-            ].filter(Boolean).join(' ').toLowerCase();
-
-            if (/do not disturb|\bdnd\b|busy/.test(text)) return 'dnd';
-            if (/available|online/.test(text))           return 'available';
-            if (/away|idle/.test(text))                  return 'away';
-            if (/invisible/.test(text))                  return 'invisible';
-            if (/offline|unavailable/.test(text))        return 'offline';
-
-            // 兜底: 查子节点 style 背景色
-            const bg = el.style && (el.style.backgroundColor || '');
-            if (/rgb\(\s*6?\s*,?\s*1?7?2?/.test(bg))     return 'available';
-            return 'unknown';
-        },
-
-        /** 入口:抓取所有可见成员 */
-        async fetchMembers() {
-            // 方案 A: 尝试通过 RC Redux store (若暴露)
-            const storeMembers = this.tryFromStore();
-            if (storeMembers && storeMembers.length) return storeMembers;
-
-            // 方案 B: DOM 扫描
-            return this.tryFromDOM();
-        },
-
-        /** 从全局 store / window 变量中拉取 */
-        tryFromStore() {
-            try {
-                const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-                // RC 内部常把 store 挂在 __store__ / __REDUX_STORE__ 等位置
-                const store = w.__store__ || w.store || w.__REDUX_STORE__;
-                if (!store || !store.getState) return null;
-                const state = store.getState();
-                // 路径可能为 state.presence / state.extensionInfo,需按实际调试
-                const presenceMap = state.presence || state.presences || null;
-                const profileMap  = state.profile  || state.extensionInfo || null;
-                if (!presenceMap || !profileMap) return null;
-
-                const list = [];
-                Object.keys(profileMap).forEach(id => {
-                    const p = profileMap[id] || {};
-                    const pr = presenceMap[id] || {};
-                    list.push({
-                        id,
-                        name:   p.displayName || p.name || 'Unknown',
-                        avatar: p.avatarUrl || '',
-                        presence: (pr.presenceStatus || pr.status || 'unknown').toLowerCase(),
-                        statusMessage: pr.userStatus || pr.message || '',
-                        updatedAt: pr.updatedAt || 0
-                    });
-                });
-                return list;
-            } catch (e) {
-                console.warn('[RCW] store 抓取失败,回退 DOM', e);
-                return null;
-            }
-        },
-
-        /** 从 DOM 树中扫描成员卡片 */
-        tryFromDOM() {
-            const members = [];
-            const seen = new Set();
-
-            // 1. 优先查找群成员容器
-            let roots = [];
-            for (const sel of SELECTORS.memberListRoot) {
-                document.querySelectorAll(sel).forEach(r => roots.push(r));
-            }
-            if (!roots.length) roots = [document.body];
-
-            // 2. 扫描每个 root 下的 member item
-            roots.forEach(root => {
-                const items = this.queryAll(root, SELECTORS.memberItem);
-                // 若没找到标准 item,退化为扫描所有头像节点
-                const candidates = items.length ? items : Array.from(root.querySelectorAll('img[alt]'));
-
-                candidates.forEach(node => {
-                    const card = items.length ? node : node.closest('div,li') || node.parentElement;
-                    if (!card || seen.has(card)) return;
-                    seen.add(card);
-
-                    const imgEl = this.queryFirst(card, SELECTORS.avatar);
-                    const nameEl = this.queryFirst(card, SELECTORS.name);
-                    const presenceEl = this.queryFirst(card, SELECTORS.presence);
-                    const statusEl = this.queryFirst(card, SELECTORS.statusMessage);
-
-                    const name = (nameEl && nameEl.textContent.trim())
-                              || (imgEl && imgEl.getAttribute('alt'))
-                              || '';
-                    if (!name || name.length > 60) return; // 过滤无效条目
-
-                    members.push({
-                        id: name + '|' + (imgEl ? imgEl.src : ''),
-                        name,
-                        avatar: imgEl ? (imgEl.src || '') : '',
-                        presence: this.detectPresence(presenceEl || card),
-                        statusMessage: statusEl ? statusEl.textContent.trim() : '',
-                        updatedAt: 0
-                    });
-                });
+    // ---------- GlipDB ----------
+    const GlipDB = (function () {
+        let dbPromise = null;
+        function open() {
+            if (dbPromise) return dbPromise;
+            dbPromise = new Promise((resolve, reject) => {
+                const req = indexedDB.open('Glip');
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
             });
-
-            // 去重
-            const unique = [];
-            const idSet = new Set();
-            members.forEach(m => {
-                if (!idSet.has(m.id)) { idSet.add(m.id); unique.push(m); }
-            });
-            return unique;
+            return dbPromise;
         }
-    };
+        function getAll(storeName) {
+            return open().then(db => new Promise((resolve, reject) => {
+                if (!db.objectStoreNames.contains(storeName)) return resolve([]);
+                const tx = db.transaction(storeName, 'readonly');
+                const req = tx.objectStore(storeName).getAll();
+                req.onsuccess = () => resolve(req.result || []);
+                req.onerror = () => reject(req.error);
+            }));
+        }
+        function get(storeName, key) {
+            return open().then(db => new Promise((resolve, reject) => {
+                if (!db.objectStoreNames.contains(storeName)) return resolve(null);
+                const tx = db.transaction(storeName, 'readonly');
+                const req = tx.objectStore(storeName).get(key);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => reject(req.error);
+            }));
+        }
+        async function getGroup(groupId) {
+            const gid = String(groupId);
+            const byNum = await get('group', Number(gid)).catch(() => null);
+            if (byNum) return byNum;
+            const byStr = await get('group', gid).catch(() => null);
+            if (byStr) return byStr;
+            const all = await getAll('group').catch(() => []);
+            return all.find(g => String(g.id) === gid) || null;
+        }
+        async function getPersonsByIds(ids) {
+            if (!ids || !ids.length) return [];
+            const db = await open();
+            if (!db.objectStoreNames.contains('person')) return [];
+            return new Promise((resolve) => {
+                const tx = db.transaction('person', 'readonly');
+                const store = tx.objectStore('person');
+                const out = [];
+                let pending = ids.length;
+                if (pending === 0) return resolve([]);
+                ids.forEach(id => {
+                    const tryKeys = [Number(id), String(id)];
+                    let tried = 0;
+                    const next = () => {
+                        if (tried >= tryKeys.length) { if (--pending === 0) resolve(out); return; }
+                        const k = tryKeys[tried++];
+                        const req = store.get(k);
+                        req.onsuccess = () => {
+                            if (req.result) { out.push(req.result); if (--pending === 0) resolve(out); }
+                            else { next(); }
+                        };
+                        req.onerror = () => next();
+                    };
+                    next();
+                });
+            });
+        }
+        return { open, getAll, get, getGroup, getPersonsByIds };
+    })();
 
-    /* =========================================================
-     * 3. 排序模块 (Sorter Module)
-     * ========================================================= */
-    function sortMembers(list) {
-        return list.slice().sort((a, b) => {
-            const ra = (PRESENCE_MAP[a.presence] || PRESENCE_MAP.unknown).rank;
-            const rb = (PRESENCE_MAP[b.presence] || PRESENCE_MAP.unknown).rank;
-            if (ra !== rb) return ra - rb;                 // 优先级1: 在线状态
-            if (a.updatedAt !== b.updatedAt)               // 优先级2: 更新时间
-                return (b.updatedAt || 0) - (a.updatedAt || 0);
-            return a.name.localeCompare(b.name);           // 兜底: 按名称
+    function headshotUrl(person) {
+        if (!person) return '';
+        const h = person.headshot;
+        if (!h) return '';
+        if (typeof h === 'string') return h;
+        const fid = h.stored_file_id || h.storedFileId;
+        const cid = h.creator_id || h.creatorId || person.id;
+        if (fid && cid) return 'https://app.ringcentral.com/file-service/creator/' + cid + '/file/' + fid + '/data?thumbnail=true';
+        return h.url || '';
+    }
+
+    const PRESENCE_RANK = { 'available': 1, 'do-not-disturb': 2, 'away': 3, 'invisible': 4, 'offline': 5, 'unknown': 6 };
+    function classifyPresence(iconEl) {
+        if (!iconEl) return 'unknown';
+        const cls = (iconEl.getAttribute('class') || '').toLowerCase();
+        if (cls.indexOf('check') >= 0 || cls.indexOf('available') >= 0) return 'available';
+        if (cls.indexOf('do-not-disturb') >= 0 || cls.indexOf('dnd') >= 0 || cls.indexOf('in-meeting') >= 0 || cls.indexOf('busy') >= 0) return 'do-not-disturb';
+        if (cls.indexOf('away') >= 0 || cls.indexOf('brb') >= 0) return 'away';
+        if (cls.indexOf('invisible') >= 0) return 'invisible';
+        if (cls.indexOf('offline') >= 0) return 'offline';
+        return 'unknown';
+    }
+    function snapshotPresenceFromDom(root) {
+        const out = new Map();
+        const rows = $$('[role="dialog"] [role="listitem"], [role="dialog"] li', root);
+        rows.forEach(row => {
+            const nameEl = row.querySelector('[data-test-automation-id*="name"], .member-name, span, p');
+            if (!nameEl) return;
+            const name = (nameEl.textContent || '').trim();
+            if (!name) return;
+            const icon = row.querySelector('.RcAvatar-presenceWrapper .icon, [class*="presence"] [class*="icon"]');
+            const state = classifyPresence(icon);
+            const key = name.toLowerCase();
+            const prev = out.get(key);
+            if (!prev || PRESENCE_RANK[state] < PRESENCE_RANK[prev]) out.set(key, state);
         });
+        return out;
     }
 
-    /* =========================================================
-     * 4. UI 渲染模块 (View Module)
-     * ========================================================= */
-    const View = {
-        fab: null,
-        panel: null,
-        list: null,
-
-        mountFab() {
-            if (this.fab) return;
-            const btn = document.createElement('div');
-            btn.id = 'rcw-fab';
-            btn.title = '查看群成员在线状态';
-            btn.innerHTML = '👁️';
-            btn.addEventListener('click', () => Controller.toggle());
-            document.body.appendChild(btn);
-            this.fab = btn;
+    const AutoCollector = {
+        async findMembersButton() {
+            return $$('button, [role="button"], a').find(el => /Members\s*\(\d+\)/i.test((el.textContent || '').trim()));
         },
-
-        mountPanel() {
-            if (this.panel) return;
-            const p = document.createElement('div');
-            p.id = 'rcw-panel';
-            p.innerHTML = `
-                <div class="rcw-head">
-                    <div>
-                        <div>群成员在线一览</div>
-                        <div class="rcw-sub" id="rcw-sub">加载中…</div>
-                    </div>
-                    <div class="rcw-close" title="关闭">✕</div>
-                </div>
-                <div class="rcw-toolbar">
-                    <button id="rcw-refresh">🔄 刷新</button>
-                    <span id="rcw-count" style="margin-left:auto;"></span>
-                </div>
-                <div class="rcw-list" id="rcw-list"></div>
-            `;
-            document.body.appendChild(p);
-            p.querySelector('.rcw-close').addEventListener('click', () => Controller.close());
-            p.querySelector('#rcw-refresh').addEventListener('click', () => Controller.refresh());
-            this.panel = p;
-            this.list = p.querySelector('#rcw-list');
+        async openDialog() {
+            const btn = await this.findMembersButton();
+            if (!btn) return false;
+            btn.click();
+            for (let i = 0; i < 30; i++) { await sleep(100); if ($('[role="dialog"] [role="listitem"], [role="dialog"] li')) return true; }
+            return false;
         },
-
-        renderList(members) {
-            if (!this.list) return;
-            if (!members.length) {
-                this.list.innerHTML = `<div class="rcw-empty">未检测到成员。<br>请先打开一个群组对话再试。</div>`;
-                this.setCount(0);
-                return;
+        findScroller() {
+            const dlg = $('[role="dialog"]');
+            if (!dlg) return null;
+            return $$('*', dlg).find(el => el.scrollHeight > el.clientHeight + 10 && el.querySelector('[role="listitem"], li')) || null;
+        },
+        async scanAll(onProgress) {
+            const merged = new Map();
+            const opened = await this.openDialog();
+            if (!opened) { WARN('open dialog failed'); return merged; }
+            await sleep(300);
+            const scroller = this.findScroller();
+            const eat = () => snapshotPresenceFromDom().forEach((v, k) => { const p = merged.get(k); if (!p || PRESENCE_RANK[v] < PRESENCE_RANK[p]) merged.set(k, v); });
+            eat();
+            if (onProgress) onProgress(merged.size);
+            if (!scroller) return merged;
+            let lastTop = -1, stable = 0;
+            for (let step = 0; step < 400; step++) {
+                scroller.scrollTop = scroller.scrollTop + Math.max(200, scroller.clientHeight - 40);
+                await sleep(140);
+                eat();
+                if (onProgress) onProgress(merged.size);
+                if (scroller.scrollTop === lastTop) { if (++stable >= 3) break; } else { stable = 0; lastTop = scroller.scrollTop; }
             }
-            const onlineCount = members.filter(m =>
-                (PRESENCE_MAP[m.presence] || {}).rank === 0
-            ).length;
-            this.setCount(members.length, onlineCount);
+            const closeBtn = $('[role="dialog"] [aria-label*="close" i], [role="dialog"] button[title*="close" i]');
+            if (closeBtn) closeBtn.click();
+            return merged;
+        }
+    };
 
-            let html = '';
-            let lastSection = null;
-            members.forEach(m => {
-                const info = PRESENCE_MAP[m.presence] || PRESENCE_MAP.unknown;
-                const section = info.rank === 0 ? 'ONLINE' : 'OTHERS';
-                if (section !== lastSection) {
-                    html += `<div class="rcw-section-label">${section === 'ONLINE' ? '🟢 在线' : '⚪ 其他'}</div>`;
-                    lastSection = section;
-                }
-                const initial = (m.name || '?').trim().charAt(0).toUpperCase();
-                const avatarStyle = m.avatar
-                    ? `background-image:url("${m.avatar}")`
-                    : `background:#ff8a00;`;
-                const statusText = m.statusMessage
-                    ? escapeHtml(m.statusMessage)
-                    : '<span class="empty">未设置签名</span>';
-                html += `
-                    <div class="rcw-item" data-name="${escapeHtml(m.name)}">
-                        <div class="rcw-avatar-wrap">
-                            <div class="rcw-avatar" style="${avatarStyle}">
-                                ${m.avatar ? '' : escapeHtml(initial)}
-                            </div>
-                            <div class="rcw-dot" style="background:${info.color}" title="${info.label}"></div>
-                        </div>
-                        <div class="rcw-info">
-                            <div class="rcw-name">${escapeHtml(m.name)}</div>
-                            <div class="rcw-status ${m.statusMessage ? '' : 'empty'}">${statusText}</div>
-                        </div>
-                    </div>
-                `;
+    function currentGroupId() {
+        const m = location.pathname.match(/\/messages\/(\d+)/);
+        return m ? m[1] : null;
+    }
+
+    async function aggregate(groupId, presenceMap) {
+        const group = await GlipDB.getGroup(groupId);
+        if (!group) return { group: null, members: [] };
+        const memberIds = group.members || group.member_ids || [];
+        const persons = await GlipDB.getPersonsByIds(memberIds);
+        const members = persons.map(p => {
+            const name = (p.display_name || ((p.first_name || '') + ' ' + (p.last_name || '')).trim() || p.email || 'Unknown').trim();
+            const key = name.toLowerCase();
+            return {
+                id: p.id,
+                name,
+                avatar: headshotUrl(p),
+                presence: presenceMap.get(key) || 'unknown',
+                signature: (p.headline || p.away_status || '').trim(),
+                awayStatusUpdatedAt: p.away_status_updated_at || 0,
+                initials: ((p.first_name || name)[0] || '?').toUpperCase()
+            };
+        });
+        return { group, members };
+    }
+
+    function sortMembers(list) {
+        const online = list.filter(m => m.presence === 'available' || m.presence === 'do-not-disturb' || m.presence === 'away');
+        const offline = list.filter(m => !(m.presence === 'available' || m.presence === 'do-not-disturb' || m.presence === 'away'));
+        online.sort((a, b) => collator.compare(a.name, b.name));
+        offline.sort((a, b) => collator.compare(a.name, b.name));
+        return { online, offline };
+    }
+
+    function injectStyles(CSS) {
+        if (document.getElementById('__RCPW_STYLE__')) return;
+        const s = document.createElement('style');
+        s.id = '__RCPW_STYLE__';
+        s.textContent = CSS;
+        document.head.appendChild(s);
+    }
+
+    function renderPanel(state) {
+        const panel = document.getElementById('__RCPW_PANEL__');
+        if (!panel) return;
+        const { members, presenceCoverage, loading } = state;
+        const total = members.length;
+        const { online, offline } = sortMembers(members);
+        const sub = loading
+            ? ('正在扫描… ' + (presenceCoverage || 0) + ' 已采集')
+            : ('共 ' + total + ' 人,在线 ' + online.length + (presenceCoverage != null ? (' · presence 覆盖 ' + presenceCoverage + '/' + total) : ''));
+        panel.querySelector('.sub').textContent = sub;
+        const listEl = panel.querySelector('.list');
+        listEl.innerHTML = '';
+        const renderSec = (label, color, arr) => {
+            if (!arr.length) return;
+            const sec = document.createElement('div');
+            sec.className = 'sec';
+            const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = color;
+            sec.appendChild(dot);
+            sec.appendChild(document.createTextNode(' ' + label + ' (' + arr.length + ')'));
+            listEl.appendChild(sec);
+            arr.forEach(m => {
+                const row = document.createElement('div'); row.className = 'row';
+                const avatar = document.createElement('div'); avatar.className = 'avatar';
+                if (m.avatar) { avatar.style.backgroundImage = 'url("' + m.avatar.replace(/"/g, '%22') + '")'; }
+                else { avatar.textContent = m.initials || '?'; avatar.style.background = '#ff7a00'; }
+                const p = document.createElement('span'); p.className = 'p ' + m.presence; avatar.appendChild(p);
+                const meta = document.createElement('div'); meta.className = 'meta';
+                const nm = document.createElement('div'); nm.className = 'name'; nm.textContent = m.name;
+                const sg = document.createElement('div'); sg.className = 'sig' + (m.signature ? '' : ' empty'); sg.textContent = m.signature || '未设置签名';
+                meta.appendChild(nm); meta.appendChild(sg);
+                row.appendChild(avatar); row.appendChild(meta);
+                listEl.appendChild(row);
             });
-            this.list.innerHTML = html;
-        },
-
-        setCount(total, online) {
-            const sub = this.panel && this.panel.querySelector('#rcw-sub');
-            const cnt = this.panel && this.panel.querySelector('#rcw-count');
-            if (sub) sub.textContent = online !== undefined
-                ? `共 ${total} 人,在线 ${online}`
-                : `共 ${total} 人`;
-            if (cnt) cnt.textContent = '';
-        },
-
-        open()  { this.panel && this.panel.classList.add('open'); },
-        close() { this.panel && this.panel.classList.remove('open'); },
-        isOpen(){ return this.panel && this.panel.classList.contains('open'); }
-    };
-
-    function escapeHtml(s) {
-        return String(s || '').replace(/[&<>"']/g, c => ({
-            '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-        }[c]));
-    }
-
-    /* =========================================================
-     * 5. 控制器 (Controller) — 协调 Scraper / View / 事件
-     * ========================================================= */
-    const Controller = {
-        async refresh() {
-            const members = await Scraper.fetchMembers();
-            const sorted  = sortMembers(members);
-            View.renderList(sorted);
-        },
-        async toggle() {
-            if (View.isOpen()) return View.close();
-            View.open();
-            await this.refresh();
-        },
-        close() { View.close(); }
-    };
-
-    /* =========================================================
-     * 6. 启动 & SPA 路由监听
-     *    RingCentral 是单页应用,history.pushState 会切换会话但不触发 load,
-     *    因此使用 MutationObserver + history hook 双保险。
-     * ========================================================= */
-    function boot() {
-        View.mountFab();
-        View.mountPanel();
-    }
-
-    // 首次等待 body 就绪
-    const waitBody = setInterval(() => {
-        if (document.body) {
-            clearInterval(waitBody);
-            boot();
-        }
-    }, 300);
-
-    // DOM 级别监听:部分页面会清空 body,确保 FAB 常驻
-    const obs = new MutationObserver(() => {
-        if (!document.getElementById('rcw-fab') && document.body) {
-            boot();
-            // 若面板开着则自动刷新
-            if (View.isOpen()) Controller.refresh();
-        }
-    });
-    obs.observe(document.documentElement, { childList: true, subtree: true });
-
-    // SPA 路由 hook
-    ['pushState', 'replaceState'].forEach(fn => {
-        const orig = history[fn];
-        history[fn] = function () {
-            const ret = orig.apply(this, arguments);
-            window.dispatchEvent(new Event('rcw:locationchange'));
-            return ret;
         };
-    });
-    window.addEventListener('popstate', () =>
-        window.dispatchEvent(new Event('rcw:locationchange')));
-    window.addEventListener('rcw:locationchange', () => {
-        if (View.isOpen()) setTimeout(() => Controller.refresh(), 600);
-    });
+        renderSec('在线', '#2ecc71', online);
+        renderSec('离线 / 隐身', '#bfc3c8', offline);
+    }
+
+    function buildPanel() {
+        let panel = document.getElementById('__RCPW_PANEL__');
+        if (panel) return panel;
+        panel = document.createElement('div');
+        panel.id = '__RCPW_PANEL__';
+        panel.innerHTML =
+            '<div class="hdr">' +
+            '<div><h3>群成员在线一览<span class="ver">v1.2.0</span></h3><div class="sub">—</div></div>' +
+            '<button class="x" title="关闭">×</button>' +
+            '</div>' +
+            '<div class="bar">' +
+            '<button data-act="scan">🔄 扫描</button>' +
+            '<button data-act="quick">⚡ 快读</button>' +
+            '<span class="tip"></span>' +
+            '</div>' +
+            '<div class="list"></div>';
+        document.body.appendChild(panel);
+        panel.style.display = 'none';
+        panel.querySelector('.x').onclick = () => { panel.style.display = 'none'; };
+        panel.querySelector('[data-act="scan"]').onclick = () => Controller.fullScan();
+        panel.querySelector('[data-act="quick"]').onclick = () => Controller.quickRead();
+        return panel;
+    }
+
+    function buildFab() {
+        let fab = document.getElementById('__RCPW_FAB__');
+        if (fab) return fab;
+        fab = document.createElement('div');
+        fab.id = '__RCPW_FAB__';
+        fab.title = '群成员在线一览';
+        fab.textContent = '👁️';
+        document.body.appendChild(fab);
+        fab.onclick = () => {
+            const panel = buildPanel();
+            const shown = panel.style.display !== 'none';
+            panel.style.display = shown ? 'none' : 'flex';
+            if (!shown) Controller.quickRead();
+        };
+        return fab;
+    }
+
+    const Controller = {
+        _cache: { groupId: null, members: [], presence: new Map() },
+        _state: { members: [], presenceCoverage: 0, loading: false },
+        _ensureGroupScope() {
+            const gid = currentGroupId();
+            if (gid !== this._cache.groupId) {
+                this._cache = { groupId: gid, members: [], presence: new Map() };
+                this._state = { members: [], presenceCoverage: 0, loading: false };
+            }
+            return gid;
+        },
+        async quickRead() {
+            const gid = this._ensureGroupScope();
+            if (!gid) return;
+            snapshotPresenceFromDom().forEach((v, k) => {
+                const p = this._cache.presence.get(k);
+                if (!p || PRESENCE_RANK[v] < PRESENCE_RANK[p]) this._cache.presence.set(k, v);
+            });
+            const { members } = await aggregate(gid, this._cache.presence);
+            this._cache.members = members;
+            this._state = { members, presenceCoverage: Array.from(this._cache.presence.values()).filter(v => v !== 'unknown').length, loading: false };
+            renderPanel(this._state);
+        },
+        async fullScan() {
+            const gid = this._ensureGroupScope();
+            if (!gid) return;
+            this._state.loading = true;
+            const preMembers = (await aggregate(gid, this._cache.presence)).members;
+            this._state.members = preMembers;
+            renderPanel(this._state);
+            const pres = await AutoCollector.scanAll((n) => {
+                this._state.presenceCoverage = n;
+                renderPanel(this._state);
+            });
+            pres.forEach((v, k) => {
+                const p = this._cache.presence.get(k);
+                if (!p || PRESENCE_RANK[v] < PRESENCE_RANK[p]) this._cache.presence.set(k, v);
+            });
+            const { members } = await aggregate(gid, this._cache.presence);
+            this._cache.members = members;
+            this._state = { members, presenceCoverage: Array.from(this._cache.presence.values()).filter(v => v !== 'unknown').length, loading: false };
+            renderPanel(this._state);
+        }
+    };
+
+    (function hookSpa() {
+        const fire = () => window.dispatchEvent(new Event('__rcpw_urlchange__'));
+        const wrap = (fn) => function () { const r = fn.apply(this, arguments); fire(); return r; };
+        history.pushState = wrap(history.pushState);
+        history.replaceState = wrap(history.replaceState);
+        window.addEventListener('popstate', fire);
+        window.addEventListener('__rcpw_urlchange__', () => { Controller._ensureGroupScope(); });
+    })();
+
+    function boot() {
+        if (!document.body) { setTimeout(boot, 100); return; }
+        injectStyles(CSS);
+        buildFab();
+        buildPanel();
+        LOG('v1.2.0 ready. Group =', currentGroupId());
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+    else boot();
+
+    window.__RCPW__ = { Controller, GlipDB, AutoCollector, sortMembers, snapshotPresenceFromDom };
+
 })();
