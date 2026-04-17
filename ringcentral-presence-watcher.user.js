@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         RingCentral Group Member Watcher (群成员在线一览)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.3.2
-// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组成员的真实头像与在线状态。v1.3.2 修复成员名称全部显示“未知”的问题：改以头像按钮（data-test-automation-class=avatar, data-uid=GLIP_PERSON.*）为行锚点，名称从 aria-label 解析，背景色从 .RcAvatar-avatarContainer 读取。
+// @version      1.3.3
+// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组全部成员的头像、在线状态与 status message (签名)。v1.3.3 修复只能显示 44/227 的问题（Glip IndexedDB 主键为 number 而非 string），并新增 away_status 签名显示。
 // @author       Anna Su
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -18,7 +18,7 @@
     const CSS = [
         "#__RCPW_FAB__{position:fixed;right:22px;bottom:22px;width:54px;height:54px;border-radius:50%;background:#ff7a00;color:#fff;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 6px 16px rgba(0,0,0,.25);cursor:pointer;z-index:2147483646;user-select:none;transition:transform .15s}",
         "#__RCPW_FAB__:hover{transform:scale(1.08)}",
-        "#__RCPW_PANEL__{position:fixed;right:22px;bottom:90px;width:360px;max-height:70vh;background:#fff;border-radius:14px;box-shadow:0 12px 32px rgba(0,0,0,.25);display:none;flex-direction:column;overflow:hidden;z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#222}",
+        "#__RCPW_PANEL__{position:fixed;right:22px;bottom:90px;width:380px;max-height:72vh;background:#fff;border-radius:14px;box-shadow:0 12px 32px rgba(0,0,0,.25);display:none;flex-direction:column;overflow:hidden;z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#222}",
         "#__RCPW_PANEL__ .hdr{background:#ff7a00;color:#fff;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:8px}",
         "#__RCPW_PANEL__ .hdr h3{margin:0;font-size:16px;font-weight:600}",
         "#__RCPW_PANEL__ .hdr .ver{opacity:.85;font-weight:400;font-size:12px;margin-left:6px}",
@@ -35,9 +35,11 @@
         "#__RCPW_PANEL__ ul{list-style:none;margin:0;padding:0 8px 8px}",
         "#__RCPW_PANEL__ li{display:flex;align-items:center;gap:10px;padding:6px 6px;border-radius:8px}",
         "#__RCPW_PANEL__ li:hover{background:#f7f7f7}",
-        "#__RCPW_PANEL__ li .av{width:32px;height:32px;border-radius:50%;background:#ccc;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:600;flex-shrink:0;background-size:cover;background-position:center;position:relative;overflow:visible}",
+        "#__RCPW_PANEL__ li .av{width:34px;height:34px;border-radius:50%;background:#ccc;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:600;flex-shrink:0;background-size:cover;background-position:center;position:relative;overflow:visible}",
         "#__RCPW_PANEL__ li .av .pdot{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:50%;border:2px solid #fff;background:#bbb}",
-        "#__RCPW_PANEL__ li .nm{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+        "#__RCPW_PANEL__ li .col{flex:1;min-width:0}",
+        "#__RCPW_PANEL__ li .nm{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+        "#__RCPW_PANEL__ li .sig{font-size:11px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}",
         "#__RCPW_PANEL__ .empty{padding:18px;color:#888;font-size:12px;text-align:center}",
         "#__RCPW_PANEL__ .ft{padding:8px 12px;border-top:1px solid #eee;font-size:11px;color:#999;display:flex;justify-content:space-between}"
     ].join('');
@@ -46,8 +48,6 @@
     const LOG = (...a) => console.log('%c[RCPW]', 'color:#ff7a00;font-weight:600', ...a);
     const WARN = (...a) => console.warn('[RCPW]', ...a);
     const sleep = ms => new Promise(r => setTimeout(r, ms));
-    const $ = (sel, root = document) => root.querySelector(sel);
-    const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
     const collator = new Intl.Collator(['zh', 'en'], { sensitivity: 'base' });
 
     function deriveInitials(name) {
@@ -59,24 +59,32 @@
     function nameColor(name) {
         let h = 0;
         for (const c of String(name || '')) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-        const hue = h % 360;
-        return 'hsl(' + hue + ',55%,55%)';
+        return 'hsl(' + (h % 360) + ',55%,55%)';
+    }
+    function toNumId(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
+    function buildDisplayName(p) {
+        if (!p) return '';
+        if (p.display_name) return String(p.display_name).trim();
+        const parts = [p.first_name, p.last_name].filter(Boolean).map(s => String(s).trim()).filter(Boolean);
+        return parts.join(' ') || (p.email ? String(p.email).split('@')[0] : '');
     }
 
     // ---------- 2. Glip IndexedDB ----------
+    // Important: Glip stores use numeric keys for person/group. Passing a string
+    // silently returns undefined. Always coerce to Number.
     const GlipDB = (() => {
         let dbPromise = null;
         function open() {
             if (dbPromise) return dbPromise;
             dbPromise = new Promise((resolve, reject) => {
                 try {
-                    const req = indexedDB.databases ? indexedDB.databases() : Promise.resolve([]);
-                    Promise.resolve(req).then(list => {
-                        const glip = (list || []).find(d => /glip/i.test(d.name || ''));
+                    const list = indexedDB.databases ? indexedDB.databases() : Promise.resolve([]);
+                    Promise.resolve(list).then(arr => {
+                        const glip = (arr || []).find(d => /glip/i.test(d.name || ''));
                         if (!glip) return reject(new Error('no glip db'));
-                        const openReq = indexedDB.open(glip.name);
-                        openReq.onsuccess = () => resolve(openReq.result);
-                        openReq.onerror = () => reject(openReq.error);
+                        const req = indexedDB.open(glip.name);
+                        req.onsuccess = () => resolve(req.result);
+                        req.onerror = () => reject(req.error);
                     }).catch(reject);
                 } catch (e) { reject(e); }
             }).catch(err => { dbPromise = null; throw err; });
@@ -84,20 +92,26 @@
         }
         function tx(db, store) { return db.transaction(store, 'readonly').objectStore(store); }
         function get(store, key) {
-            return open().then(db => new Promise((resolve, reject) => {
+            return open().then(db => new Promise((resolve) => {
                 try {
                     const r = tx(db, store).get(key);
                     r.onsuccess = () => resolve(r.result);
-                    r.onerror = () => reject(r.error);
-                } catch (e) { reject(e); }
+                    r.onerror = () => resolve(null);
+                } catch (e) { resolve(null); }
             })).catch(() => null);
         }
-        function getGroup(gid) { return get('group', String(gid)); }
+        function getGroup(gid) {
+            const n = toNumId(gid);
+            if (n == null) return Promise.resolve(null);
+            return get('group', n).then(v => v || get('group', String(gid)));
+        }
         function getPersonsByIds(ids) {
             return open().then(db => {
                 const store = tx(db, 'person');
                 return Promise.all(ids.map(id => new Promise(res => {
-                    const r = store.get(String(id));
+                    const n = toNumId(id);
+                    if (n == null) return res(null);
+                    const r = store.get(n);
                     r.onsuccess = () => res(r.result || null);
                     r.onerror = () => res(null);
                 })));
@@ -130,19 +144,9 @@
         return ra <= rb ? a : b;
     }
 
-    // ---------- 4. DOM snapshot ----------
-    // The row anchor is the avatar BUTTON itself:
-    //   [data-test-automation-class="avatar"][data-uid^="GLIP_PERSON."]
-    //   - aria-label starts with the display name, e.g. "Abhijit Padhy, mini profile. ..."
-    //   - contains a nested [data-test-automation-id="presence"] with type/title
-    //   - contains either a <canvas> (real avatar) or .avatar-short-name inside .RcAvatar-avatarContainer (colored bg)
-    // We exclude topBar avatars and conversation-list chat avatars because those are not group members.
+    // ---------- 4. DOM snapshot (presence + canvas avatar for currently-rendered members) ----------
     function parseNameFromAriaLabel(label) {
         if (!label) return '';
-        // Common patterns:
-        //  "Jane Doe, mini profile. Press Enter to view ..."
-        //  "Jane Doe mini profile"  (some variants)
-        //  "Jane Doe"
         const cut = label.split(',')[0];
         return cut.replace(/\b(mini profile|profile|avatar)\b.*$/i, '').trim();
     }
@@ -159,7 +163,6 @@
         if (!m) return null;
         const personId = m[1];
         const name = parseNameFromAriaLabel(btn.getAttribute('aria-label') || '');
-        // presence
         const presenceEl = btn.querySelector('[data-test-automation-id="presence"]');
         let presence = 'unknown';
         if (presenceEl) {
@@ -168,7 +171,6 @@
             presence = normalizePresence(type);
             if (presence === 'unknown') presence = normalizePresence(title);
         }
-        // avatar: canvas preferred; else short-name + container bg
         const avatarDataUrl = captureCanvas(btn);
         let initials = '', bg = '';
         if (!avatarDataUrl) {
@@ -177,8 +179,7 @@
                 initials = (sn.textContent || '').trim();
                 const container = sn.closest('[class*="RcAvatar-avatarContainer"]') || sn.parentElement;
                 if (container) {
-                    const cs = getComputedStyle(container);
-                    const c = cs.backgroundColor;
+                    const c = getComputedStyle(container).backgroundColor;
                     if (c && !/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/i.test(c) && c !== 'transparent') bg = c;
                 }
             }
@@ -187,30 +188,11 @@
         if (!bg) bg = nameColor(name);
         return { personId, name, presence, avatarDataUrl, initials, bg };
     }
-    function isGroupMemberAvatar(btn) {
-        // Accept right-shelf team member list avatars and any Members dialog rows
-        const tid = btn.getAttribute('data-test-automation-id') || '';
-        if (tid === 'rightShelfMemberListAvatar') return true;
-        // Exclude obvious non-member surfaces
-        if (tid === 'topBarAvatar') return false;
-        // Conversation list item avatars: inside .conversation-list-item
-        if (btn.closest('.conversation-list-item, [data-test-automation-id*="conversation"]')) return false;
-        // Message sender avatars in chat stream
-        if (btn.closest('[data-test-automation-id*="message"]')) return false;
-        // Mini profile / hover cards – exclude
-        if (btn.closest('[role="dialog"] [class*="profile"], [class*="miniProfile"], [class*="MiniProfile"]')) return false;
-        // Members dialog (team settings) – keep
-        if (btn.closest('[data-test-automation-id*="MemberItem"], [data-test-automation-id*="member-item"], [data-test-automation-id*="teamMember"]')) return true;
-        // Default: accept if it sits inside a members list region
-        if (btn.closest('[data-test-automation-id*="MemberList"], [data-test-automation-id*="memberList"], [data-test-automation-id*="Members"]')) return true;
-        return false;
-    }
     function snapshotFromDom() {
         const byId = new Map();
         const byName = new Map();
         const btns = document.querySelectorAll('[data-test-automation-class="avatar"][data-uid^="GLIP_PERSON"]');
         btns.forEach(b => {
-            if (!isGroupMemberAvatar(b)) return;
             const prof = readAvatarButton(b);
             if (!prof) return;
             if (prof.personId) {
@@ -290,11 +272,13 @@
                     const people = await GlipDB.getPersonsByIds(ids);
                     people.forEach((p, i) => {
                         const pid = String((p && p.id) || ids[i]);
-                        const nm = p ? (p.display_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email || '').trim() : '';
+                        const nm = buildDisplayName(p);
                         const fromDom = cache.byId.get(pid) || (nm && cache.byName.get(nm.toLowerCase())) || null;
+                        const sig = p && p.away_status ? String(p.away_status) : '';
                         members.push({
                             personId: pid,
                             name: nm || (fromDom && fromDom.name) || '',
+                            status: sig,
                             presence: fromDom ? fromDom.presence : 'unknown',
                             avatarDataUrl: fromDom ? fromDom.avatarDataUrl : '',
                             initials: (fromDom && fromDom.initials) || deriveInitials(nm),
@@ -302,14 +286,14 @@
                         });
                     });
                 }
-            } catch (e) { /* fall through */ }
+            } catch (e) { WARN('glip aggregate failed', e); }
         }
         if (!members.length) {
             const seen = new Set();
-            cache.byId.forEach(v => { seen.add(v.personId); members.push(v); });
+            cache.byId.forEach(v => { seen.add(v.personId); members.push({ ...v, status: '' }); });
             cache.byName.forEach(v => {
                 if (v.personId && seen.has(v.personId)) return;
-                members.push(v);
+                members.push({ ...v, status: '' });
             });
         }
         const uniq = new Map();
@@ -317,7 +301,7 @@
             const k = m.personId || (m.name || '').toLowerCase();
             if (!k) return;
             const prev = uniq.get(k);
-            uniq.set(k, prev ? mergeProfile(prev, m) : m);
+            uniq.set(k, prev ? { ...mergeProfile(prev, m), status: prev.status || m.status } : m);
         });
         return Array.from(uniq.values());
     }
@@ -348,6 +332,13 @@
         const bg = m.bg || nameColor(m.name);
         return '<span class="av" style="background:' + bg + '">' + escapeHtml(m.initials || deriveInitials(m.name)) + '<span class="pdot" style="background:' + PRESENCE_COLOR[m.presence] + '"></span></span>';
     }
+    function renderItem(m) {
+        const sig = (m.status || '').trim();
+        const right = sig
+            ? '<div class="col"><div class="nm" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name || '(未知)') + '</div><div class="sig" title="' + escapeHtml(sig) + '">' + escapeHtml(sig) + '</div></div>'
+            : '<div class="col"><div class="nm" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name || '(未知)') + '</div></div>';
+        return '<li>' + renderAvatar(m) + right + '</li>';
+    }
     function renderPanel(panel, members) {
         const online = members.filter(m => m.presence === 'available');
         const busy = members.filter(m => ['busy', 'doNotDisturb', 'inMeeting', 'onCall'].includes(m.presence));
@@ -360,15 +351,15 @@
         const body = panel.querySelector('.body');
         const renderSec = (label, color, list) => {
             if (!list.length) return '';
-            const items = sortMembers(list).map(m => '<li>' + renderAvatar(m) + '<span class="nm" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name || '(未知)') + '</span></li>').join('');
+            const items = sortMembers(list).map(renderItem).join('');
             return '<div class="sec"><h4><span class="dot" style="background:' + color + '"></span>' + label + ' (' + list.length + ')</h4><ul>' + items + '</ul></div>';
         };
         let html = '';
         html += renderSec('在线', '#2ecc71', online);
         html += renderSec('忙碌 / 会议 / 通话', '#e67e22', busy);
         html += renderSec('离开', '#f1c40f', away);
-        html += renderSec('离线 / 隐身', '#bdbdbd', offline);
-        if (!html) html = '<div class="empty">没有获取到成员，请确认已打开某个群组的成员列表。</div>';
+        html += renderSec('离线 / 未覆盖', '#bdbdbd', offline);
+        if (!html) html = '<div class="empty">没有获取到成员；请确认正处在某个群组页面。</div>';
         body.innerHTML = html;
     }
 
@@ -380,14 +371,14 @@
         panel.innerHTML = [
             '<div class="hdr">',
             '  <div>',
-            '    <h3>群成员在线一览<span class="ver">v1.3.2</span></h3>',
+            '    <h3>群成员在线一览<span class="ver">v1.3.3</span></h3>',
             '    <div class="sub">初始化中…</div>',
             '  </div>',
             '  <button class="x" title="关闭">×</button>',
             '</div>',
             '<div class="bar">',
-            '  <button data-act="scan" title="重新扫描当前可见成员">🔄 扫描</button>',
-            '  <button data-act="fast" title="快速读取（不滚动）">⚡ 快读</button>',
+            '  <button data-act="scan" title="重新扫描">🔄 扫描</button>',
+            '  <button data-act="fast" title="快速读取">⚡ 快读</button>',
             '  <span class="tip"></span>',
             '</div>',
             '<div class="body"><div class="empty">点击「扫描」开始。</div></div>',
@@ -470,7 +461,7 @@
         injectStyles();
         buildFab();
         AutoCollector.start();
-        LOG('ready v1.3.2');
+        LOG('ready v1.3.3');
     }
     boot();
 
@@ -480,6 +471,7 @@
         scan: (o) => Controller.scan(o),
         snapshot: () => snapshotFromDom(),
         cache: () => AutoCollector.cache,
-        version: '1.3.2'
+        aggregate: () => aggregate(),
+        version: '1.3.3'
     };
 })();
