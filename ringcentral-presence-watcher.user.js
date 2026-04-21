@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         RingCentral Group Member Watcher (群成员在线一览)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.3.3
-// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组全部成员的头像、在线状态与 status message (签名)。v1.3.3 修复只能显示 44/227 的问题（Glip IndexedDB 主键为 number 而非 string），并新增 away_status 签名显示。
+// @version      1.4.0
+// @description  悬浮按钮 + 弹出面板，显示当前 RingCentral 群组全部成员的头像、在线状态与 status message (签名)。v1.4.0 新增今日当天休假/OOO事件展示（读取 Glip IndexedDB eventItem store）。
 // @author       Anna Su
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -40,6 +40,9 @@
         "#__RCPW_PANEL__ li .col{flex:1;min-width:0}",
         "#__RCPW_PANEL__ li .nm{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
         "#__RCPW_PANEL__ li .sig{font-size:11px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}",
+        // NEW v1.4.0: event badge styles
+        "#__RCPW_PANEL__ li .ev{font-size:10px;color:#e67e22;background:#fff3e0;border-radius:4px;padding:1px 5px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;display:block}",
+        "#__RCPW_PANEL__ li .ev.allday{color:#9b59b6;background:#f3e5f5}",
         "#__RCPW_PANEL__ .empty{padding:18px;color:#888;font-size:12px;text-align:center}",
         "#__RCPW_PANEL__ .ft{padding:8px 12px;border-top:1px solid #eee;font-size:11px;color:#999;display:flex;justify-content:space-between}"
     ].join('');
@@ -70,8 +73,6 @@
     }
 
     // ---------- 2. Glip IndexedDB ----------
-    // Important: Glip stores use numeric keys for person/group. Passing a string
-    // silently returns undefined. Always coerce to Number.
     const GlipDB = (() => {
         let dbPromise = null;
         function open() {
@@ -117,7 +118,45 @@
                 })));
             }).catch(() => ids.map(() => null));
         }
-        return { open, get, getGroup, getPersonsByIds };
+
+        // NEW v1.4.0: scan eventItem for today's events, return map: personId(string) -> [{text,start,end,all_day}]
+        function getTodayEvents(groupId) {
+            return open().then(db => new Promise(resolve => {
+                try {
+                    const now = new Date();
+                    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0).getTime();
+                    const todayEnd   = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59).getTime();
+                    const gidNum = groupId ? toNumId(groupId) : null;
+                    const store = tx(db, 'eventItem');
+                    const cursor = store.openCursor();
+                    const map = {};
+                    cursor.onsuccess = e => {
+                        const c = e.target.result;
+                        if (!c) { resolve(map); return; }
+                        const v = c.value;
+                        const start = v.start || 0;
+                        const end   = v.effective_end || v.end || 0;
+                        const overlapsToday =
+                            (start >= todayStart && start <= todayEnd) ||
+                            (end   >= todayStart && end   <= todayEnd) ||
+                            (start <= todayStart && end   >= todayEnd);
+                        if (overlapsToday && v.creator_id) {
+                            const gids = v.group_ids || [];
+                            const inGroup = !gidNum || gids.includes(gidNum);
+                            if (inGroup) {
+                                const pid = String(v.creator_id);
+                                if (!map[pid]) map[pid] = [];
+                                map[pid].push({ text: v.text || '', start: v.start, end: v.effective_end || v.end, all_day: !!v.all_day });
+                            }
+                        }
+                        c.continue();
+                    };
+                    cursor.onerror = () => resolve({});
+                } catch (e) { resolve({}); }
+            })).catch(() => ({}));
+        }
+
+        return { open, get, getGroup, getPersonsByIds, getTodayEvents };
     })();
 
     // ---------- 3. presence ----------
@@ -144,7 +183,7 @@
         return ra <= rb ? a : b;
     }
 
-    // ---------- 4. DOM snapshot (presence + canvas avatar for currently-rendered members) ----------
+    // ---------- 4. DOM snapshot ----------
     function parseNameFromAriaLabel(label) {
         if (!label) return '';
         const cut = label.split(',')[0];
@@ -189,8 +228,7 @@
         return { personId, name, presence, avatarDataUrl, initials, bg };
     }
     function snapshotFromDom() {
-        const byId = new Map();
-        const byName = new Map();
+        const byId = new Map(), byName = new Map();
         const btns = document.querySelectorAll('[data-test-automation-class="avatar"][data-uid^="GLIP_PERSON"]');
         btns.forEach(b => {
             const prof = readAvatarButton(b);
@@ -218,14 +256,8 @@
         };
     }
     function mergeSnap(dst, snap) {
-        snap.byId.forEach((v, k) => {
-            const prev = dst.byId.get(k);
-            dst.byId.set(k, prev ? mergeProfile(prev, v) : v);
-        });
-        snap.byName.forEach((v, k) => {
-            const prev = dst.byName.get(k);
-            dst.byName.set(k, prev ? mergeProfile(prev, v) : v);
-        });
+        snap.byId.forEach((v, k) => { const prev = dst.byId.get(k); dst.byId.set(k, prev ? mergeProfile(prev, v) : v); });
+        snap.byName.forEach((v, k) => { const prev = dst.byName.get(k); dst.byName.set(k, prev ? mergeProfile(prev, v) : v); });
     }
 
     // ---------- 5. Auto collector ----------
@@ -235,26 +267,29 @@
         start() {
             if (this._observer) return;
             this._snapshotNow();
-            this._observer = new MutationObserver(() => {
-                clearTimeout(this._t);
-                this._t = setTimeout(() => this._snapshotNow(), 250);
-            });
+            this._observer = new MutationObserver(() => { clearTimeout(this._t); this._t = setTimeout(() => this._snapshotNow(), 250); });
             this._observer.observe(document.body, { childList: true, subtree: true });
         },
-        stop() {
-            if (this._observer) { this._observer.disconnect(); this._observer = null; }
-        },
-        _snapshotNow() {
-            try {
-                const snap = snapshotFromDom();
-                mergeSnap(this._cache, snap);
-            } catch (e) { /* ignore */ }
-        },
+        stop() { if (this._observer) { this._observer.disconnect(); this._observer = null; } },
+        _snapshotNow() { try { mergeSnap(this._cache, snapshotFromDom()); } catch (e) {} },
         reset() { this._cache = { byId: new Map(), byName: new Map() }; },
         get cache() { return this._cache; }
     };
 
-    // ---------- 6. aggregation ----------
+    // ---------- 6. event time badge (NEW v1.4.0) ----------
+    function formatEventBadge(ev) {
+        if (ev.all_day) {
+            return { text: '📅 全天 · ' + (ev.text || 'OOO'), cls: 'ev allday' };
+        }
+        const fmt = ts => {
+            const d = new Date(ts);
+            const h = d.getHours(), m = d.getMinutes();
+            return (h < 10 ? '0' + h : h) + ':' + (m < 10 ? '0' + m : m);
+        };
+        return { text: '🏖 ' + fmt(ev.start) + '–' + fmt(ev.end) + ' · ' + (ev.text || 'OOO'), cls: 'ev' };
+    }
+
+    // ---------- 7. aggregation ----------
     function currentGroupId() {
         const m = location.pathname.match(/\/messages?\/(\d+)/);
         return m ? m[1] : null;
@@ -264,6 +299,10 @@
         const cache = AutoCollector.cache;
         const gid = currentGroupId();
         let members = [];
+
+        // Fetch today's events in parallel with group/person lookups
+        const todayEventsMap = await GlipDB.getTodayEvents(gid).catch(() => ({}));
+
         if (gid) {
             try {
                 const group = await GlipDB.getGroup(gid);
@@ -276,13 +315,13 @@
                         const fromDom = cache.byId.get(pid) || (nm && cache.byName.get(nm.toLowerCase())) || null;
                         const sig = p && p.away_status ? String(p.away_status) : '';
                         members.push({
-                            personId: pid,
-                            name: nm || (fromDom && fromDom.name) || '',
+                            personId: pid, name: nm || (fromDom && fromDom.name) || '',
                             status: sig,
                             presence: fromDom ? fromDom.presence : 'unknown',
                             avatarDataUrl: fromDom ? fromDom.avatarDataUrl : '',
                             initials: (fromDom && fromDom.initials) || deriveInitials(nm),
-                            bg: (fromDom && fromDom.bg) || nameColor(nm)
+                            bg: (fromDom && fromDom.bg) || nameColor(nm),
+                            todayEvents: todayEventsMap[pid] || []
                         });
                     });
                 }
@@ -290,31 +329,31 @@
         }
         if (!members.length) {
             const seen = new Set();
-            cache.byId.forEach(v => { seen.add(v.personId); members.push({ ...v, status: '' }); });
-            cache.byName.forEach(v => {
-                if (v.personId && seen.has(v.personId)) return;
-                members.push({ ...v, status: '' });
-            });
+            cache.byId.forEach(v => { seen.add(v.personId); members.push({ ...v, status: '', todayEvents: todayEventsMap[v.personId] || [] }); });
+            cache.byName.forEach(v => { if (v.personId && seen.has(v.personId)) return; members.push({ ...v, status: '', todayEvents: todayEventsMap[v.personId] || [] }); });
         }
         const uniq = new Map();
         members.forEach(m => {
             const k = m.personId || (m.name || '').toLowerCase();
             if (!k) return;
             const prev = uniq.get(k);
-            uniq.set(k, prev ? { ...mergeProfile(prev, m), status: prev.status || m.status } : m);
+            uniq.set(k, prev ? {
+                ...mergeProfile(prev, m),
+                status: prev.status || m.status,
+                todayEvents: (prev.todayEvents || []).length ? prev.todayEvents : (m.todayEvents || [])
+            } : m);
         });
         return Array.from(uniq.values());
     }
     function sortMembers(list) {
         return list.slice().sort((a, b) => {
-            const ra = PRESENCE_RANK[a.presence] ?? 99;
-            const rb = PRESENCE_RANK[b.presence] ?? 99;
+            const ra = PRESENCE_RANK[a.presence] ?? 99, rb = PRESENCE_RANK[b.presence] ?? 99;
             if (ra !== rb) return ra - rb;
             return collator.compare(a.name || '', b.name || '');
         });
     }
 
-    // ---------- 7. UI ----------
+    // ---------- 8. UI ----------
     function injectStyles() {
         if (document.getElementById('__RCPW_STYLE__')) return;
         const s = document.createElement('style');
@@ -334,53 +373,49 @@
     }
     function renderItem(m) {
         const sig = (m.status || '').trim();
-        const right = sig
-            ? '<div class="col"><div class="nm" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name || '(未知)') + '</div><div class="sig" title="' + escapeHtml(sig) + '">' + escapeHtml(sig) + '</div></div>'
-            : '<div class="col"><div class="nm" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name || '(未知)') + '</div></div>';
-        return '<li>' + renderAvatar(m) + right + '</li>';
+        const evs = m.todayEvents || [];
+        const evHtml = evs.map(ev => {
+            const badge = formatEventBadge(ev);
+            return '<span class="' + badge.cls + '" title="' + escapeHtml(badge.text) + '">' + escapeHtml(badge.text) + '</span>';
+        }).join('');
+        const nameDiv = '<div class="nm" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name || '(未知)') + '</div>';
+        const sigDiv  = sig ? '<div class="sig" title="' + escapeHtml(sig) + '">' + escapeHtml(sig) + '</div>' : '';
+        return '<li>' + renderAvatar(m) + '<div class="col">' + nameDiv + sigDiv + evHtml + '</div></li>';
     }
     function renderPanel(panel, members) {
-        const online = members.filter(m => m.presence === 'available');
-        const busy = members.filter(m => ['busy', 'doNotDisturb', 'inMeeting', 'onCall'].includes(m.presence));
-        const away = members.filter(m => m.presence === 'away');
+        const online  = members.filter(m => m.presence === 'available');
+        const busy    = members.filter(m => ['busy','doNotDisturb','inMeeting','onCall'].includes(m.presence));
+        const away    = members.filter(m => m.presence === 'away');
         const offline = members.filter(m => m.presence === 'offline' || m.presence === 'unknown');
-        const total = members.length;
+        const total   = members.length;
         const covered = members.filter(m => m.presence !== 'unknown').length;
+        const oooCount = members.filter(m => m.todayEvents && m.todayEvents.length > 0).length;
         const head = panel.querySelector('.sub');
-        if (head) head.textContent = '共 ' + total + ' 人，在线 ' + online.length + ' · presence 覆盖 ' + covered + '/' + total;
+        if (head) {
+            let sub = '共 ' + total + ' 人，在线 ' + online.length + ' · presence 覆盖 ' + covered + '/' + total;
+            if (oooCount > 0) sub += ' · 今日休假 ' + oooCount + ' 人';
+            head.textContent = sub;
+        }
         const body = panel.querySelector('.body');
         const renderSec = (label, color, list) => {
             if (!list.length) return '';
-            const items = sortMembers(list).map(renderItem).join('');
-            return '<div class="sec"><h4><span class="dot" style="background:' + color + '"></span>' + label + ' (' + list.length + ')</h4><ul>' + items + '</ul></div>';
+            return '<div class="sec"><h4><span class="dot" style="background:' + color + '"></span>' + label + ' (' + list.length + ')</h4><ul>' + sortMembers(list).map(renderItem).join('') + '</ul></div>';
         };
         let html = '';
         html += renderSec('在线', '#2ecc71', online);
         html += renderSec('忙碌 / 会议 / 通话', '#e67e22', busy);
         html += renderSec('离开', '#f1c40f', away);
         html += renderSec('离线 / 未覆盖', '#bdbdbd', offline);
-        if (!html) html = '<div class="empty">没有获取到成员；请确认正处在某个群组页面。</div>';
-        body.innerHTML = html;
+        body.innerHTML = html || '<div class="empty">没有获取到成员；请确认正处在某个群组页面。</div>';
     }
-
     function buildPanel() {
         let panel = document.getElementById('__RCPW_PANEL__');
         if (panel) return panel;
         panel = document.createElement('div');
         panel.id = '__RCPW_PANEL__';
         panel.innerHTML = [
-            '<div class="hdr">',
-            '  <div>',
-            '    <h3>群成员在线一览<span class="ver">v1.3.3</span></h3>',
-            '    <div class="sub">初始化中…</div>',
-            '  </div>',
-            '  <button class="x" title="关闭">×</button>',
-            '</div>',
-            '<div class="bar">',
-            '  <button data-act="scan" title="重新扫描">🔄 扫描</button>',
-            '  <button data-act="fast" title="快速读取">⚡ 快读</button>',
-            '  <span class="tip"></span>',
-            '</div>',
+            '<div class="hdr"><div><h3>群成员在线一览<span class="ver">v1.4.0</span></h3><div class="sub">初始化中…</div></div><button class="x" title="关闭">×</button></div>',
+            '<div class="bar"><button data-act="scan">🔄 扫描</button><button data-act="fast">⚡ 快读</button><span class="tip"></span></div>',
             '<div class="body"><div class="empty">点击「扫描」开始。</div></div>',
             '<div class="ft"><span>Anna\'s RCPW</span><span class="stat"></span></div>'
         ].join('');
@@ -402,33 +437,22 @@
         return fab;
     }
 
-    // ---------- 8. Controller ----------
+    // ---------- 9. Controller ----------
     const Controller = {
         _visible: false,
-        show() {
-            const panel = buildPanel();
-            panel.style.display = 'flex';
-            this._visible = true;
-            this.scan({ fast: true });
-        },
-        hide() {
-            const panel = document.getElementById('__RCPW_PANEL__');
-            if (panel) panel.style.display = 'none';
-            this._visible = false;
-        },
+        show() { const p = buildPanel(); p.style.display = 'flex'; this._visible = true; this.scan({ fast: true }); },
+        hide() { const p = document.getElementById('__RCPW_PANEL__'); if (p) p.style.display = 'none'; this._visible = false; },
         toggle() { this._visible ? this.hide() : this.show(); },
         async scan(opts) {
             opts = opts || {};
             const panel = buildPanel();
-            const tip = panel.querySelector('.tip');
-            const stat = panel.querySelector('.stat');
+            const tip = panel.querySelector('.tip'), stat = panel.querySelector('.stat');
             tip.textContent = opts.fast ? '快读中…' : '扫描中…';
             try {
                 AutoCollector._snapshotNow();
                 const members = await aggregate();
                 renderPanel(panel, members);
-                const covered = members.filter(m => m.presence !== 'unknown').length;
-                stat.textContent = '已覆盖 ' + covered + '/' + members.length;
+                stat.textContent = '已覆盖 ' + members.filter(m => m.presence !== 'unknown').length + '/' + members.length;
                 tip.textContent = new Date().toLocaleTimeString();
             } catch (e) {
                 WARN('scan failed', e);
@@ -437,10 +461,9 @@
         }
     };
 
-    // ---------- 9. SPA hooks ----------
+    // ---------- 10. SPA hooks ----------
     (function hookSpa() {
-        const push = history.pushState;
-        const replace = history.replaceState;
+        const push = history.pushState, replace = history.replaceState;
         const fire = () => window.dispatchEvent(new Event('__rcpw_locchange__'));
         history.pushState = function () { const r = push.apply(this, arguments); fire(); return r; };
         history.replaceState = function () { const r = replace.apply(this, arguments); fire(); return r; };
@@ -451,27 +474,21 @@
         });
     })();
 
-    // ---------- 10. boot ----------
+    // ---------- 11. boot ----------
     async function boot() {
         injectStyles();
         for (let i = 0; i < 40; i++) {
             if (document.body && document.querySelector('[data-test-automation-id]')) break;
             await sleep(500);
         }
-        injectStyles();
-        buildFab();
-        AutoCollector.start();
-        LOG('ready v1.3.3');
+        injectStyles(); buildFab(); AutoCollector.start();
+        LOG('ready v1.4.0');
     }
     boot();
 
     window.__RCPW__ = {
-        show: () => Controller.show(),
-        hide: () => Controller.hide(),
-        scan: (o) => Controller.scan(o),
-        snapshot: () => snapshotFromDom(),
-        cache: () => AutoCollector.cache,
-        aggregate: () => aggregate(),
-        version: '1.3.3'
+        show: () => Controller.show(), hide: () => Controller.hide(),
+        scan: o => Controller.scan(o), snapshot: () => snapshotFromDom(),
+        cache: () => AutoCollector.cache, aggregate: () => aggregate(), version: '1.4.0'
     };
 })();
