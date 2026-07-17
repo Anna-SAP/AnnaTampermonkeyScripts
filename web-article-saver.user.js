@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Web Article Saver (网页正文提取保存)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.1.0
+// @version      1.1.1
 // @description  悬浮按钮一键提取网页纯净正文：剔除广告/侧边栏/评论区/导航等噪音，完整保留图片、SVG、表格、代码块、图表等正文资产；相对路径自动转绝对路径，可选图片 Base64 内嵌（完全离线可读），下载为独立 HTML 文件。支持 claude.ai artifact 等"正文在跨域沙箱 iframe 中"的分享页。快捷键 Alt+Shift+S 快速保存。
 // @author       Anna Su
 // @match        http://*/*
@@ -19,7 +19,7 @@
     'use strict';
 
     // ---------- 0. 常量与配置 ----------
-    const VERSION = '1.1.0';
+    const VERSION = '1.1.1';
     const LOG = (...a) => console.log('%c[WCX]', 'color:#2563eb;font-weight:600', ...a);
     const WARN = (...a) => console.warn('[WCX]', ...a);
 
@@ -955,28 +955,99 @@
         a.remove();
     }
 
-    function downloadHTML(html, title) {
-        const d = new Date();
-        const ymd = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
-        const host = sanitizeFilename(location.hostname.replace(/^[0-9a-f-]{20,}\./i, ''));  // 去掉 artifact 域名前缀哈希
-        const fn = sanitizeFilename(title) + '_' + host + '_' + ymd + '.html';
-        const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        // 优先 GM_download：由扩展进程执行下载，不受页面 sandbox（缺 allow-downloads）
-        // 与 CSP 限制影响 —— claude.ai artifact 的沙箱 iframe 里 <a download> 会被浏览器拦截
-        let handed = false;
-        if (gmDownload) {
+    // ---- 沙箱 iframe 下载中继 ----
+    // claude.ai artifact 的沙箱 iframe 无 allow-downloads：<a download> 被浏览器静默拦截，
+    // GM_download 对页面 blob: URL 的支持也不可靠（下载模式/白名单相关）。
+    // 但本脚本同时运行在顶层宿主页面（外壳模式），顶层无沙箱限制 ——
+    // 让 iframe 实例把 HTML postMessage 给顶层实例代为下载，并等待回执确认。
+    const DL_MSG = '__WCX_DL_v1__';
+    let lastRelayAt = 0;
+
+    // 顶层：接收内嵌 frame 的下载请求（带多重防滥用校验）
+    function setupTopRelay() {
+        window.addEventListener('message', e => {
+            const d = e.data;
+            if (!d || d.t !== DL_MSG || d.ack || typeof d.html !== 'string' || typeof d.fn !== 'string') return;
+            // 来源必须是本页面里真实存在的内容级大 iframe（拦掉广告位等小 frame 的伪造请求）
+            const frame = [...document.querySelectorAll('iframe')].find(f => f.contentWindow === e.source);
+            if (!frame) return;
+            const r = frame.getBoundingClientRect();
+            const vw = Math.max(1, window.innerWidth), vh = Math.max(1, window.innerHeight);
+            if (r.width < 500 || r.height < 350 || (r.width * r.height) / (vw * vh) < 0.25) return;
+            const now = Date.now();
+            if (now - lastRelayAt < 2000) return;             // 节流：2 秒最多一次
+            lastRelayAt = now;
+            const fn = sanitizeFilename(String(d.fn).replace(/\.html?$/i, '')) + '.html';  // 强制 .html
+            const url = URL.createObjectURL(new Blob([d.html], { type: 'text/html;charset=utf-8' }));
+            anchorDownload(url, fn);
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            try { e.source.postMessage({ t: DL_MSG, ack: d.id }, '*'); } catch (err) { }
+            LOG('已代内嵌 frame 下载:', fn);
+        });
+    }
+
+    // 子 frame：请求顶层代下载，3 秒内收到回执视为成功
+    function relayDownloadViaTop(html, fn) {
+        return new Promise(resolve => {
+            const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+            let settled = false;
+            const finish = ok => { if (!settled) { settled = true; window.removeEventListener('message', onMsg); resolve(ok); } };
+            const onMsg = e => { const d = e.data; if (d && d.t === DL_MSG && d.ack === id) finish(true); };
+            window.addEventListener('message', onMsg);
+            try { window.top.postMessage({ t: DL_MSG, id, fn, html }, '*'); } catch (e) { finish(false); return; }
+            setTimeout(() => finish(false), 3000);
+        });
+    }
+
+    // GM_download Promise 化：onload/onerror/超时都有明确结果，不再"发射后不管"
+    function gmDownloadURL(url, fn) {
+        return new Promise(resolve => {
+            if (!gmDownload) { resolve(false); return; }
+            let settled = false;
+            const finish = ok => { if (!settled) { settled = true; resolve(ok); } };
             try {
                 gmDownload({
                     url, name: fn, saveAs: false,
-                    onerror: e => { WARN('GM_download 失败，回退 <a download>:', e && (e.error || e.message)); anchorDownload(url, fn); },
+                    onload: () => finish(true),
+                    onerror: e => { WARN('GM_download 失败:', e && (e.error || e.message)); finish(false); },
+                    ontimeout: () => finish(false),
                 });
-                handed = true;
-            } catch (e) { WARN('GM_download 异常，回退 <a download>:', e && e.message); }
+            } catch (e) { WARN('GM_download 异常:', e && e.message); finish(false); }
+            setTimeout(() => finish(false), 8000);
+        });
+    }
+
+    // 返回 { fn, bytes, via }；via = 'anchor' | 'top' | 'gm' | 'unverified'
+    // （'unverified' 表示走了沙箱内 <a download> 兜底，无法确认文件真正落盘）
+    async function downloadHTML(html, title) {
+        const d = new Date();
+        const ymd = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+        let host = location.hostname;
+        if (IS_FRAME && document.referrer) {
+            try { host = new URL(document.referrer).hostname; } catch (e) { }
         }
-        if (!handed) anchorDownload(url, fn);
+        host = sanitizeFilename(host.replace(/^[0-9a-f-]{20,}\./i, ''));   // 去掉 artifact 域名哈希前缀
+        const fn = sanitizeFilename(title) + '_' + host + '_' + ymd + '.html';
+        const bytes = new Blob([html]).size;
+
+        if (IS_FRAME) {
+            // 沙箱 frame 首选顶层中继（唯一可确认成功的通道）
+            if (await relayDownloadViaTop(html, fn)) return { fn, bytes, via: 'top' };
+            const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+            if (await gmDownloadURL(url, fn)) {
+                setTimeout(() => URL.revokeObjectURL(url), 60000);
+                return { fn, bytes, via: 'gm' };
+            }
+            anchorDownload(url, fn);                          // 尽力而为，可能被沙箱拦截
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            return { fn, bytes, via: 'unverified' };
+        }
+
+        // 顶层：<a download> 直接可用，最可靠
+        const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+        anchorDownload(url, fn);
         setTimeout(() => URL.revokeObjectURL(url), 60000);
-        return { fn, bytes: blob.size };
+        return { fn, bytes, via: 'anchor' };
     }
 
     // ---------- 9. UI（悬浮按钮 / 菜单 / 进度提示 / 预览） ----------
@@ -1271,13 +1342,20 @@
                 await embedAssets(ex.root, null, { blobOnly: true });
             }
             const html = buildDoc(ex.root, meta, { embedded: !!embed });
-            const { fn, bytes } = downloadHTML(html, meta.title);
+            const { fn, bytes, via } = await downloadHTML(html, meta.title);
             const sizeStr = bytes > 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : Math.round(bytes / 1024) + ' KB';
-            let msg = '✅ 已保存：' + fn + '（' + sizeStr + '）';
-            if (embedInfo && embedInfo.failedCount) msg += '，' + embedInfo.failedCount + ' 张图片抓取失败已保留在线链接';
-            if (ex.usedFallback) msg += '（整页模式）';
-            toast(msg, { duration: 6000 });
-            LOG('saved', fn, sizeStr, embedInfo || '');
+            if (via === 'unverified') {
+                // 沙箱 frame 内所有可确认通道均失败，<a download> 兜底无法验证是否落盘，不能谎报成功
+                toast('⚠️ 已尝试下载 ' + fn + '，但当前内容处于受限沙箱且宿主页面未能代为下载。'
+                    + '若未看到文件：请确认 Tampermonkey 也在顶层页面运行，或在 Tampermonkey 设置中将下载模式改为"浏览器 API"。', { duration: 10000 });
+            } else {
+                let msg = '✅ 已保存：' + fn + '（' + sizeStr + '）';
+                if (via === 'top') msg += '（经由宿主页面下载）';
+                if (embedInfo && embedInfo.failedCount) msg += '，' + embedInfo.failedCount + ' 张图片抓取失败已保留在线链接';
+                if (ex.usedFallback) msg += '（整页模式）';
+                toast(msg, { duration: 6000 });
+            }
+            LOG('saved', fn, sizeStr, 'via=' + via, embedInfo || '');
         } catch (e) {
             WARN(e);
             toast('❌ 保存失败：' + (e && e.message));
@@ -1338,6 +1416,7 @@
     }
 
     function initTopMode() {
+        setupTopRelay();          // 无论是否外壳页都监听：为内容级 iframe 代执行下载
         mountUI();
         if (isShellTopPage()) fab.style.display = 'none';   // 显隐由 buildFab 的守护 interval 持续复核
     }
