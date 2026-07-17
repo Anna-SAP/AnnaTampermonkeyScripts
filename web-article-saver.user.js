@@ -1,17 +1,17 @@
 // ==UserScript==
 // @name         Web Article Saver (网页正文提取保存)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.0
-// @description  悬浮按钮一键提取网页纯净正文：剔除广告/侧边栏/评论区/导航等噪音，完整保留图片、SVG、表格、代码块、图表等正文资产；相对路径自动转绝对路径，可选图片 Base64 内嵌（完全离线可读），下载为独立 HTML 文件。快捷键 Alt+Shift+S 快速保存。
+// @version      1.1.0
+// @description  悬浮按钮一键提取网页纯净正文：剔除广告/侧边栏/评论区/导航等噪音，完整保留图片、SVG、表格、代码块、图表等正文资产；相对路径自动转绝对路径，可选图片 Base64 内嵌（完全离线可读），下载为独立 HTML 文件。支持 claude.ai artifact 等"正文在跨域沙箱 iframe 中"的分享页。快捷键 Alt+Shift+S 快速保存。
 // @author       Anna Su
 // @match        http://*/*
 // @match        https://*/*
 // @icon         data:image/svg+xml;utf8,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%20100%20100%22%3E%3Ctext%20y=%22.9em%22%20font-size=%2290%22%3E%F0%9F%93%A5%3C/text%3E%3C/svg%3E
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
+// @grant        GM_download
 // @connect      *
 // @run-at       document-idle
-// @noframes
 // @updateURL    https://raw.githubusercontent.com/Anna-SAP/AnnaTampermonkeyScripts/main/web-article-saver.user.js
 // @downloadURL  https://raw.githubusercontent.com/Anna-SAP/AnnaTampermonkeyScripts/main/web-article-saver.user.js
 // ==/UserScript==
@@ -19,7 +19,7 @@
     'use strict';
 
     // ---------- 0. 常量与配置 ----------
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const LOG = (...a) => console.log('%c[WCX]', 'color:#2563eb;font-weight:600', ...a);
     const WARN = (...a) => console.warn('[WCX]', ...a);
 
@@ -81,6 +81,11 @@
     const gmXHR = (typeof GM_xmlhttpRequest === 'function') ? GM_xmlhttpRequest
         : (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') ? GM.xmlHttpRequest
             : null;
+    const gmDownload = (typeof GM_download === 'function') ? GM_download
+        : (typeof GM !== 'undefined' && GM && typeof GM.download === 'function') ? GM.download
+            : null;
+    // 是否运行在子 frame 中（claude.ai artifact 等把正文放在跨域沙箱 iframe 里）
+    const IS_FRAME = (() => { try { return window.self !== window.top; } catch (e) { return true; } })();
 
     // ---------- 1. 基础工具 ----------
     const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
@@ -256,10 +261,17 @@
             if (n.parentElement) bump(n.parentElement.parentElement, pts / 2);
         });
 
+        // 候选归一化：表格内部结构元素（tbody/tr/td…）不能作为提取根——
+        // 脱离 <table> 上下文序列化时会被 HTML 解析器丢弃标签，整张表格报废。
+        // 提升到 table 的父容器（表格型 artifact 页面正是这种结构）
+        const normalizeCandidate = el => {
+            const t = el.closest && el.closest('table');
+            return (t && t.parentElement) ? t.parentElement : el;
+        };
         const pool = new Set();
-        [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).forEach(([el]) => pool.add(el));
+        [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).forEach(([el]) => pool.add(normalizeCandidate(el)));
         try {
-            document.querySelectorAll(HINT_SELECTORS).forEach(el => pool.add(el));
+            document.querySelectorAll(HINT_SELECTORS).forEach(el => pool.add(normalizeCandidate(el)));
         } catch (e) { /* 选择器兼容性兜底 */ }
 
         // 2b. 用统一的精细评分挑最优
@@ -720,8 +732,14 @@
         const now = new Date();
         const words = textOf(root).length;
         const readMin = Math.max(1, Math.ceil(words / 400));
+        // frame 模式下 location 是内容沙箱域（如 *.claudeusercontent.com 哈希域），
+        // 对读者无意义，优先记录 referrer 指向的宿主页面
+        let srcURL = location.href, srcHost = location.hostname;
+        if (IS_FRAME && document.referrer) {
+            try { srcHost = new URL(document.referrer).hostname; srcURL = document.referrer; } catch (e) { }
+        }
         const metaBits = [];
-        metaBits.push('<a href="' + esc(location.href) + '">' + esc(location.hostname) + '</a>');
+        metaBits.push('<a href="' + esc(srcURL) + '">' + esc(srcHost) + '</a>');
         if (meta.byline) metaBits.push(esc(meta.byline));
         if (meta.published) metaBits.push(esc(meta.published));
         metaBits.push('约 ' + words + ' 字 · ' + readMin + ' 分钟');
@@ -738,7 +756,7 @@
             '<meta name="viewport" content="width=device-width, initial-scale=1">',
             '<meta name="referrer" content="no-referrer">',
             '<title>' + esc(meta.title) + '</title>',
-            '<!-- Saved by Web Article Saver v' + VERSION + ' | ' + esc(location.href) + ' | ' + now.toISOString() + ' -->',
+            '<!-- Saved by Web Article Saver v' + VERSION + ' | ' + esc(srcURL) + ' | ' + now.toISOString() + ' -->',
             '<style>' + DOC_CSS + '</style>',
             '</head>',
             '<body>',
@@ -746,7 +764,7 @@
             '<h1 class="wcx-title">' + esc(meta.title) + '</h1>',
             '<div class="wcx-meta">' + metaBits.join(' · ') + '</div>',
             '<main class="wcx-body">' + root.innerHTML + '</main>',
-            '<div class="wcx-footer">本文保存自 <a href="' + esc(location.href) + '">' + esc(location.href) + '</a><br>'
+            '<div class="wcx-footer">本文保存自 <a href="' + esc(srcURL) + '">' + esc(srcURL) + '</a><br>'
             + '保存时间：' + esc(now.toLocaleString()) + ' · Web Article Saver v' + VERSION
             + (opts && opts.embedded ? ' · 图片已内嵌 (Base64)' : ' · 图片为在线引用') + '</div>',
             '</div>',
@@ -928,19 +946,36 @@
             .slice(0, 80) || 'article';
     }
 
-    function downloadHTML(html, title) {
-        const d = new Date();
-        const ymd = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
-        const fn = sanitizeFilename(title) + '_' + location.hostname + '_' + ymd + '.html';
-        const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
+    function anchorDownload(url, fn) {
         const a = document.createElement('a');
         a.href = url;
         a.download = fn;
         document.documentElement.appendChild(a);
         a.click();
         a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 15000);
+    }
+
+    function downloadHTML(html, title) {
+        const d = new Date();
+        const ymd = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+        const host = sanitizeFilename(location.hostname.replace(/^[0-9a-f-]{20,}\./i, ''));  // 去掉 artifact 域名前缀哈希
+        const fn = sanitizeFilename(title) + '_' + host + '_' + ymd + '.html';
+        const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        // 优先 GM_download：由扩展进程执行下载，不受页面 sandbox（缺 allow-downloads）
+        // 与 CSP 限制影响 —— claude.ai artifact 的沙箱 iframe 里 <a download> 会被浏览器拦截
+        let handed = false;
+        if (gmDownload) {
+            try {
+                gmDownload({
+                    url, name: fn, saveAs: false,
+                    onerror: e => { WARN('GM_download 失败，回退 <a download>:', e && (e.error || e.message)); anchorDownload(url, fn); },
+                });
+                handed = true;
+            } catch (e) { WARN('GM_download 异常，回退 <a download>:', e && e.message); }
+        }
+        if (!handed) anchorDownload(url, fn);
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
         return { fn, bytes: blob.size };
     }
 
@@ -1093,10 +1128,16 @@
             applyFabPos(r.left, r.top);
         });
 
-        // SPA 重渲染守护：UI 被移除时重挂
+        // SPA 重渲染守护：UI 被移除时重挂；顶层同时复核外壳页显隐
+        // （SPA 可能在运行中导航进/出 artifact 类外壳页）
         setInterval(() => {
             if (fab && !fab.isConnected) document.documentElement.appendChild(fab);
             if (menu && !menu.isConnected) document.documentElement.appendChild(menu);
+            if (!IS_FRAME && fab) {
+                const shell = isShellTopPage();
+                const want = shell ? 'none' : 'flex';
+                if (fab.style.display !== want) { fab.style.display = want; if (shell) hideMenu(); }
+            }
         }, 3000);
     }
 
@@ -1174,6 +1215,10 @@
 
     function openPreview() {
         if (busy) { toast('正在处理中，请稍候…'); return; }
+        if (!IS_FRAME && isShellTopPage()) {
+            toast('⚠️ 本页正文位于跨域内嵌页面中，请点击内容区域内的悬浮按钮操作');
+            return;
+        }
         toast('正在提取正文…', { sticky: true });
         setTimeout(() => {
             try {
@@ -1203,6 +1248,10 @@
     // ---------- 11. 主流程 ----------
     async function saveArticle(embed) {
         if (busy) { toast('正在处理中，请稍候…'); return; }
+        if (!IS_FRAME && isShellTopPage()) {
+            toast('⚠️ 本页正文位于跨域内嵌页面中，请点击内容区域内的悬浮按钮操作（或先点击内容再按 Alt+Shift+S）');
+            return;
+        }
         busy = true;
         try {
             toast('正在提取正文…', { sticky: true });
@@ -1238,8 +1287,41 @@
     }
 
     // ---------- 12. 初始化 ----------
-    function init() {
-        if (window.top !== window) return;               // @noframes 兜底
+    // "外壳页"判定：顶层自身几乎没有正文，且被一个大型跨域 iframe 覆盖
+    // （claude.ai artifact 分享页即此结构——正文在 *.claudeusercontent.com 沙箱 iframe 里，
+    //   脚本会在那个 iframe 内单独挂载按钮，顶层按钮只会误存外壳，故隐藏）
+    function isShellTopPage() {
+        if (!document.body) return false;
+        if (textOf(document.body).length > 3000) return false;
+        const vw = window.innerWidth || 1, vh = window.innerHeight || 1;
+        for (const f of document.querySelectorAll('iframe')) {
+            const r = f.getBoundingClientRect();
+            if (r.width * r.height < 0.6 * vw * vh) continue;
+            try { void f.contentDocument.documentElement; } catch (e) { return true; }  // 跨域大 iframe
+            if (!f.contentDocument) return true;
+        }
+        return false;
+    }
+
+    // 子 frame 挂载资格：与顶层跨域（顶层无法触达本文档）、视口足够大、
+    // 不是视频/播放器类嵌入 —— 避免在广告位、追踪像素、YouTube 播放器里冒出按钮
+    function frameEligible() {
+        if (EMBED_IFRAME_RE.test(location.href)) return false;
+        if (window.innerWidth < 500 || window.innerHeight < 350) return false;
+        try { void window.top.document; return false; } catch (e) { return true; }
+    }
+
+    function frameHasContent() {
+        if (!document.body) return false;
+        if (document.body.querySelector('table, pre')) return true;
+        if (textOf(document.body).length >= 300) return true;
+        // 纯图形类内容（SVG 图表 / canvas / 大图）；注意 React 壳页也有空 <main>，
+        // 故不能用 article/main 作为内容判据
+        const media = document.body.querySelector('svg, canvas, img[src]');
+        return !!(media && media.getBoundingClientRect().width > 200);
+    }
+
+    function mountUI() {
         injectStyles();
         buildFab();
         buildMenu();
@@ -1251,7 +1333,28 @@
                 saveArticle(false);
             }
         });
-        LOG('Web Article Saver v' + VERSION + ' ready.', gmXHR ? '(GM_xmlhttpRequest 可用)' : '(GM_xmlhttpRequest 不可用，Base64 内嵌将受 CORS 限制)');
+        LOG('Web Article Saver v' + VERSION + ' ready' + (IS_FRAME ? ' (frame mode: ' + location.hostname + ')' : '') + '.',
+            gmXHR ? '(GM_xmlhttpRequest 可用)' : '(GM_xmlhttpRequest 不可用，Base64 内嵌将受 CORS 限制)');
+    }
+
+    function initTopMode() {
+        mountUI();
+        if (isShellTopPage()) fab.style.display = 'none';   // 显隐由 buildFab 的守护 interval 持续复核
+    }
+
+    function initFrameMode() {
+        if (!frameEligible()) return;
+        // 内容可能异步渲染（artifact 的 mermaid/表格等），轮询等待
+        let tries = 0;
+        (function attempt() {
+            if (frameHasContent()) { mountUI(); return; }
+            if (++tries < 20) setTimeout(attempt, 1000);
+        })();
+    }
+
+    function init() {
+        if (IS_FRAME) initFrameMode();
+        else initTopMode();
     }
 
     if (document.body) init();
