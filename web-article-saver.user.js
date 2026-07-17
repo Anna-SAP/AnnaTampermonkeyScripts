@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Web Article Saver (网页正文提取保存)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.1.1
-// @description  悬浮按钮一键提取网页纯净正文：剔除广告/侧边栏/评论区/导航等噪音，完整保留图片、SVG、表格、代码块、图表等正文资产；相对路径自动转绝对路径，可选图片 Base64 内嵌（完全离线可读），下载为独立 HTML 文件。支持 claude.ai artifact 等"正文在跨域沙箱 iframe 中"的分享页。快捷键 Alt+Shift+S 快速保存。
+// @version      1.2.0
+// @description  悬浮按钮一键提取网页纯净正文：剔除广告/侧边栏/评论区/导航等噪音，完整保留图片、SVG、表格、代码块、图表等正文资产；相对路径自动转绝对路径，可选图片 Base64 内嵌（完全离线可读），下载为独立 HTML 文件，或经浏览器打印引擎导出 PDF（文字可选、矢量清晰）。支持 claude.ai artifact 等"正文在跨域沙箱 iframe 中"的分享页。快捷键 Alt+Shift+S 快速保存。
 // @author       Anna Su
 // @match        http://*/*
 // @match        https://*/*
@@ -19,7 +19,7 @@
     'use strict';
 
     // ---------- 0. 常量与配置 ----------
-    const VERSION = '1.1.1';
+    const VERSION = '1.2.0';
     const LOG = (...a) => console.log('%c[WCX]', 'color:#2563eb;font-weight:600', ...a);
     const WARN = (...a) => console.warn('[WCX]', ...a);
 
@@ -724,7 +724,16 @@
         'ul,ol{padding-left:1.6em}',
         'li{margin:.3em 0}',
         '.wcx-footer{margin-top:52px;padding-top:14px;border-top:1px solid var(--border);color:var(--muted);font-size:.8em;line-height:1.6}',
-        '@media print{.wcx-page{max-width:100%;padding:0}pre{white-space:pre-wrap}}',
+        '@page{margin:16mm 13mm}',
+        // 打印/导出 PDF：强制浅色调色板（避免暗色模式打出深底 PDF）、保留代码块与表头底色、避免关键元素被断页劈开
+        '@media print{',
+        ':root{--bg:#ffffff;--fg:#1f2328;--muted:#59636e;--border:#d1d9e0;--codebg:#f6f8fa;--accent:#0969da}',
+        '.wcx-page{max-width:100%;padding:0}',
+        'pre{white-space:pre-wrap}',
+        'pre,code,th{print-color-adjust:exact;-webkit-print-color-adjust:exact}',
+        'tr,img,figure{break-inside:avoid}',
+        'a{word-break:break-all}',
+        '}',
     ].join('\n');
 
     function buildDoc(root, meta, opts) {
@@ -977,6 +986,13 @@
             const now = Date.now();
             if (now - lastRelayAt < 2000) return;             // 节流：2 秒最多一次
             lastRelayAt = now;
+            if (d.mode === 'print') {
+                // 代打印：接受即回执（打印流程含图片等待，异步进行，避免 frame 侧超时后重复弹窗）
+                try { e.source.postMessage({ t: DL_MSG, ack: d.id }, '*'); } catch (err) { }
+                printHTMLViaIframe(String(d.html));
+                LOG('已代内嵌 frame 调起打印对话框');
+                return;
+            }
             const fn = sanitizeFilename(String(d.fn).replace(/\.html?$/i, '')) + '.html';  // 强制 .html
             const url = URL.createObjectURL(new Blob([d.html], { type: 'text/html;charset=utf-8' }));
             anchorDownload(url, fn);
@@ -986,15 +1002,17 @@
         });
     }
 
-    // 子 frame：请求顶层代下载，3 秒内收到回执视为成功
-    function relayDownloadViaTop(html, fn) {
+    // 子 frame：请求顶层代执行（mode: 'download' | 'print'），3 秒内收到回执视为成功
+    function relayViaTop(payload) {
         return new Promise(resolve => {
             const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
             let settled = false;
             const finish = ok => { if (!settled) { settled = true; window.removeEventListener('message', onMsg); resolve(ok); } };
             const onMsg = e => { const d = e.data; if (d && d.t === DL_MSG && d.ack === id) finish(true); };
             window.addEventListener('message', onMsg);
-            try { window.top.postMessage({ t: DL_MSG, id, fn, html }, '*'); } catch (e) { finish(false); return; }
+            try {
+                window.top.postMessage({ t: DL_MSG, id, mode: payload.mode || 'download', fn: payload.fn, html: payload.html }, '*');
+            } catch (e) { finish(false); return; }
             setTimeout(() => finish(false), 3000);
         });
     }
@@ -1032,7 +1050,7 @@
 
         if (IS_FRAME) {
             // 沙箱 frame 首选顶层中继（唯一可确认成功的通道）
-            if (await relayDownloadViaTop(html, fn)) return { fn, bytes, via: 'top' };
+            if (await relayViaTop({ mode: 'download', fn, html })) return { fn, bytes, via: 'top' };
             const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
             if (await gmDownloadURL(url, fn)) {
                 setTimeout(() => URL.revokeObjectURL(url), 60000);
@@ -1048,6 +1066,108 @@
         anchorDownload(url, fn);
         setTimeout(() => URL.revokeObjectURL(url), 60000);
         return { fn, bytes, via: 'anchor' };
+    }
+
+    // ---------- 8b. PDF 导出（浏览器打印引擎，对话框中选"另存为 PDF"） ----------
+    // 不用 jsPDF/html2canvas：中文需内嵌巨型字体、内容被栅格化、表格质量差。
+    // 打印引擎输出的 PDF 文字可选、矢量清晰，文件名默认取文档 <title>（即文章标题）。
+    function printHTMLViaIframe(html) {
+        return new Promise(resolve => {
+            const fr = document.createElement('iframe');
+            fr.id = '__WCX_PRINT__';
+            // 不能 display:none（不渲染则无法打印）；用零尺寸 + visibility 隐藏
+            fr.setAttribute('style', 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden');
+            // 内容已消毒，仍禁脚本双保险；allow-modals 是 print() 的前提，allow-same-origin 供本脚本调用
+            fr.setAttribute('sandbox', 'allow-same-origin allow-modals');
+            let settled = false, printURL = null, cleaned = false;
+            const finish = ok => { if (!settled) { settled = true; resolve(ok); } };
+            const cleanup = () => {
+                if (cleaned) return;
+                cleaned = true;
+                fr.remove();
+                if (printURL) { URL.revokeObjectURL(printURL); printURL = null; }
+            };
+            fr.addEventListener('load', () => {
+                let doc = null;
+                try { doc = fr.contentDocument; } catch (e) { }
+                if (!doc || !doc.body || doc.body.children.length === 0) return;  // 空白初载/被 CSP 拦，等下一次或超时
+                // 等图片就绪（上限 10s），再留 400ms 让字体与布局稳定
+                const pending = [...doc.images].filter(i => !i.complete);
+                let went = false;
+                const go = () => {
+                    if (went) return;
+                    went = true;
+                    setTimeout(() => {
+                        try {
+                            fr.contentWindow.focus();
+                            fr.contentWindow.print();
+                            finish(true);
+                        } catch (e) { WARN('print 调用失败:', e && e.message); finish(false); }
+                        // 对话框关闭后回收；afterprint 并非处处可靠，2 分钟兜底
+                        try { fr.contentWindow.addEventListener('afterprint', () => setTimeout(cleanup, 500)); } catch (e) { }
+                        setTimeout(cleanup, 120000);
+                    }, 400);
+                };
+                if (!pending.length) { go(); return; }
+                let left = pending.length;
+                const done = () => { if (--left <= 0) go(); };
+                pending.forEach(i => { i.addEventListener('load', done); i.addEventListener('error', done); });
+                setTimeout(go, 10000);
+            });
+            try {
+                fr.srcdoc = toTrustedHTML(html);              // 先赋值再挂载，避免 about:blank 抢跑 load
+            } catch (e) {
+                printURL = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+                fr.src = printURL;
+            }
+            document.documentElement.appendChild(fr);
+            setTimeout(() => { if (!settled) { finish(false); cleanup(); } }, 20000);  // load 始终未达（CSP 拦截等）
+        });
+    }
+
+    async function exportPDF() {
+        if (busy) { toast('正在处理中，请稍候…'); return; }
+        if (!IS_FRAME && isShellTopPage()) {
+            toast('⚠️ 本页正文位于跨域内嵌页面中，请点击内容区域内的悬浮按钮操作');
+            return;
+        }
+        busy = true;
+        try {
+            toast('正在提取正文…', { sticky: true });
+            await new Promise(r => setTimeout(r, 30));
+            const ex = extractContent();
+            if (!ex) { toast('⚠️ 未能找到可提取的正文'); return; }
+            const meta = getPageMeta(ex.root);
+            // 走打印引擎前先内嵌图片：在线图偶发加载失败会在 PDF 里变成空框
+            const embedInfo = await embedAssets(ex.root, (done, total) => {
+                toast('正在内嵌图片 ' + done + '/' + total + ' …', { sticky: true, progress: total ? done / total : 1 });
+            });
+            const html = buildDoc(ex.root, meta, { embedded: true });
+            let viaTop = false, ok;
+            if (IS_FRAME) {
+                viaTop = await relayViaTop({ mode: 'print', fn: meta.title, html });
+                ok = viaTop || await printHTMLViaIframe(html);
+            } else {
+                ok = await printHTMLViaIframe(html);
+            }
+            if (viaTop) {
+                toast('🖨 已在宿主页面打开打印对话框，请在"目标/打印机"中选择「另存为 PDF」', { duration: 9000 });
+            } else if (ok && IS_FRAME) {
+                // 沙箱内本地 print 可能被静默忽略，无法确认，措辞留余地
+                toast('🖨 已尝试打开打印对话框，请选择「另存为 PDF」；若无反应请改用"下载 HTML"', { duration: 9000 });
+            } else if (ok) {
+                let msg = '🖨 已打开打印对话框，请在"目标/打印机"中选择「另存为 PDF」';
+                if (embedInfo && embedInfo.failedCount) msg += '（' + embedInfo.failedCount + ' 张图片抓取失败）';
+                toast(msg, { duration: 9000 });
+            } else {
+                toast('❌ 打印对话框未能打开（可能被页面沙箱或 CSP 限制），请改用"下载 HTML"', { duration: 8000 });
+            }
+        } catch (e) {
+            WARN(e);
+            toast('❌ PDF 导出失败：' + (e && e.message));
+        } finally {
+            busy = false;
+        }
     }
 
     // ---------- 9. UI（悬浮按钮 / 菜单 / 进度提示 / 预览） ----------
@@ -1122,6 +1242,7 @@
             ['👁', '预览提取结果', () => openPreview()],
             ['📄', '下载 HTML（图片在线引用）', () => saveArticle(false)],
             ['📦', '下载 HTML（图片 Base64 内嵌，离线可用）', () => saveArticle(true)],
+            ['🖨', '导出 PDF（打印对话框中选「另存为 PDF」）', () => exportPDF()],
         ];
         for (const [icon, label, fn] of items) {
             const b = document.createElement('button');
@@ -1259,6 +1380,7 @@
         };
         mk('下载（在线图片）', 'pri', () => { closePreview(); saveArticle(false); });
         mk('下载（内嵌 Base64）', '', () => { closePreview(); saveArticle(true); });
+        mk('导出 PDF', '', () => { closePreview(); exportPDF(); });
         mk('✕ 关闭', '', () => closePreview());
         previewFrame = document.createElement('iframe');
         previewFrame.setAttribute('sandbox', '');     // 禁脚本禁同源，纯静态预览
@@ -1381,11 +1503,11 @@
         return false;
     }
 
-    // 子 frame 挂载资格：与顶层跨域（顶层无法触达本文档）、视口足够大、
-    // 不是视频/播放器类嵌入 —— 避免在广告位、追踪像素、YouTube 播放器里冒出按钮
+    // 子 frame 挂载的静态资格：与顶层跨域（顶层无法触达本文档）、非视频/播放器类嵌入。
+    // 注意：尺寸不在这里查——脚本注入时宿主可能尚未完成布局（innerWidth 为 0），
+    // 尺寸与内容一样属于"会就绪"的动态条件，放进 initFrameMode 的轮询里反复复查
     function frameEligible() {
         if (EMBED_IFRAME_RE.test(location.href)) return false;
-        if (window.innerWidth < 500 || window.innerHeight < 350) return false;
         try { void window.top.document; return false; } catch (e) { return true; }
     }
 
@@ -1423,10 +1545,12 @@
 
     function initFrameMode() {
         if (!frameEligible()) return;
-        // 内容可能异步渲染（artifact 的 mermaid/表格等），轮询等待
+        // 尺寸（宿主布局就绪后 innerWidth 才有值）与内容（mermaid/表格等异步渲染）都轮询等待；
+        // 尺寸门槛用于把广告位、追踪像素类小 frame 挡在外面
         let tries = 0;
         (function attempt() {
-            if (frameHasContent()) { mountUI(); return; }
+            const sized = window.innerWidth >= 500 && window.innerHeight >= 350;
+            if (sized && frameHasContent()) { mountUI(); return; }
             if (++tries < 20) setTimeout(attempt, 1000);
         })();
     }
