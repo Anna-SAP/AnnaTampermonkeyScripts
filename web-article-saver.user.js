@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Web Article Saver (网页正文提取保存)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.2.0
-// @description  悬浮按钮一键提取网页纯净正文：剔除广告/侧边栏/评论区/导航等噪音，完整保留图片、SVG、表格、代码块、图表等正文资产；相对路径自动转绝对路径，可选图片 Base64 内嵌（完全离线可读），下载为独立 HTML 文件，或经浏览器打印引擎导出 PDF（文字可选、矢量清晰）。支持 claude.ai artifact 等"正文在跨域沙箱 iframe 中"的分享页。快捷键 Alt+Shift+S 快速保存。
+// @version      1.3.0
+// @description  悬浮按钮一键提取网页纯净正文：剔除广告/侧边栏/评论区/导航等噪音，完整保留图片、SVG、表格、代码块、图表等正文资产；相对路径自动转绝对路径，可选图片 Base64 内嵌（完全离线可读），下载为独立 HTML 文件；PDF 双通道：自动保存到下载目录（html2canvas+jsPDF），或打印对话框导出（文字可选）。支持 claude.ai artifact 等"正文在跨域沙箱 iframe 中"的分享页。快捷键 Alt+Shift+S 快速保存。
 // @author       Anna Su
 // @match        http://*/*
 // @match        https://*/*
@@ -11,6 +11,8 @@
 // @grant        GM.xmlHttpRequest
 // @grant        GM_download
 // @connect      *
+// @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
+// @require      https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/Anna-SAP/AnnaTampermonkeyScripts/main/web-article-saver.user.js
 // @downloadURL  https://raw.githubusercontent.com/Anna-SAP/AnnaTampermonkeyScripts/main/web-article-saver.user.js
@@ -19,7 +21,7 @@
     'use strict';
 
     // ---------- 0. 常量与配置 ----------
-    const VERSION = '1.2.0';
+    const VERSION = '1.3.0';
     const LOG = (...a) => console.log('%c[WCX]', 'color:#2563eb;font-weight:600', ...a);
     const WARN = (...a) => console.warn('[WCX]', ...a);
 
@@ -766,7 +768,11 @@
             '<meta name="referrer" content="no-referrer">',
             '<title>' + esc(meta.title) + '</title>',
             '<!-- Saved by Web Article Saver v' + VERSION + ' | ' + esc(srcURL) + ' | ' + now.toISOString() + ' -->',
-            '<style>' + DOC_CSS + '</style>',
+            '<style>' + DOC_CSS + '</style>'
+            // PDF 栅格化渲染必须强制浅色（渲染 iframe 会继承浏览器暗色偏好，否则整本 PDF 是深底）
+            + (opts && opts.forceLight
+                ? '<style>html{color-scheme:light}:root{--bg:#ffffff;--fg:#1f2328;--muted:#59636e;--border:#d1d9e0;--codebg:#f6f8fa;--accent:#0969da}</style>'
+                : ''),
             '</head>',
             '<body>',
             '<div class="wcx-page">',
@@ -976,7 +982,9 @@
     function setupTopRelay() {
         window.addEventListener('message', e => {
             const d = e.data;
-            if (!d || d.t !== DL_MSG || d.ack || typeof d.html !== 'string' || typeof d.fn !== 'string') return;
+            if (!d || d.t !== DL_MSG || d.ack || typeof d.fn !== 'string') return;
+            const isBlob = (typeof Blob !== 'undefined') && (d.blob instanceof Blob);
+            if (!isBlob && typeof d.html !== 'string') return;
             // 来源必须是本页面里真实存在的内容级大 iframe（拦掉广告位等小 frame 的伪造请求）
             const frame = [...document.querySelectorAll('iframe')].find(f => f.contentWindow === e.source);
             if (!frame) return;
@@ -987,14 +995,18 @@
             if (now - lastRelayAt < 2000) return;             // 节流：2 秒最多一次
             lastRelayAt = now;
             if (d.mode === 'print') {
+                if (typeof d.html !== 'string') return;
                 // 代打印：接受即回执（打印流程含图片等待，异步进行，避免 frame 侧超时后重复弹窗）
                 try { e.source.postMessage({ t: DL_MSG, ack: d.id }, '*'); } catch (err) { }
                 printHTMLViaIframe(String(d.html));
                 LOG('已代内嵌 frame 调起打印对话框');
                 return;
             }
-            const fn = sanitizeFilename(String(d.fn).replace(/\.html?$/i, '')) + '.html';  // 强制 .html
-            const url = URL.createObjectURL(new Blob([d.html], { type: 'text/html;charset=utf-8' }));
+            // 扩展名强制与载荷类型绑定：PDF blob → .pdf，其余一律 .html
+            const ext = (isBlob && d.blob.type === 'application/pdf') ? '.pdf' : '.html';
+            const fn = sanitizeFilename(String(d.fn).replace(/\.(html?|pdf)$/i, '')) + ext;
+            const blob = isBlob ? d.blob : new Blob([d.html], { type: 'text/html;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
             anchorDownload(url, fn);
             setTimeout(() => URL.revokeObjectURL(url), 60000);
             try { e.source.postMessage({ t: DL_MSG, ack: d.id }, '*'); } catch (err) { }
@@ -1011,7 +1023,7 @@
             const onMsg = e => { const d = e.data; if (d && d.t === DL_MSG && d.ack === id) finish(true); };
             window.addEventListener('message', onMsg);
             try {
-                window.top.postMessage({ t: DL_MSG, id, mode: payload.mode || 'download', fn: payload.fn, html: payload.html }, '*');
+                window.top.postMessage({ t: DL_MSG, id, mode: payload.mode || 'download', fn: payload.fn, html: payload.html, blob: payload.blob }, '*');
             } catch (e) { finish(false); return; }
             setTimeout(() => finish(false), 3000);
         });
@@ -1125,7 +1137,7 @@
         });
     }
 
-    async function exportPDF() {
+    async function exportPDFViaPrint() {
         if (busy) { toast('正在处理中，请稍候…'); return; }
         if (!IS_FRAME && isShellTopPage()) {
             toast('⚠️ 本页正文位于跨域内嵌页面中，请点击内容区域内的悬浮按钮操作');
@@ -1165,6 +1177,192 @@
         } catch (e) {
             WARN(e);
             toast('❌ PDF 导出失败：' + (e && e.message));
+        } finally {
+            busy = false;
+        }
+    }
+
+    // ---------- 8c. PDF 自动导出（html2canvas 栅格化 + jsPDF，直接落到浏览器下载目录） ----------
+    // 打印对话框的保存位置由所选"打印机"决定（如 WPS 虚拟打印机会写进临时目录），脚本无法控制；
+    // 此通道由脚本自己生成 PDF 字节流，走与 HTML 相同的下载链路（含沙箱 frame 顶层中继）。
+    // 中文经浏览器渲染后栅格化，显示完好；代价是文字不可选中——需要可选文字时用打印通道。
+
+    // 把独立 HTML 文档在离屏 iframe 中排版渲染成一张长 canvas
+    function renderDocToCanvas(html) {
+        return new Promise((resolve, reject) => {
+            if (typeof html2canvas !== 'function') { reject(new Error('html2canvas 未加载（@require 被禁用？）')); return; }
+            const fr = document.createElement('iframe');
+            fr.id = '__WCX_RENDER__';
+            // 离屏但正常渲染：不能用 visibility:hidden（html2canvas 会跳过隐藏元素）
+            fr.setAttribute('style', 'position:fixed;left:-12000px;top:0;width:794px;height:800px;border:0;pointer-events:none');
+            fr.setAttribute('sandbox', 'allow-same-origin');
+            let settled = false, blobURL = null;
+            const finish = (v, err) => {
+                if (settled) return;
+                settled = true;
+                fr.remove();
+                if (blobURL) URL.revokeObjectURL(blobURL);
+                err ? reject(err) : resolve(v);
+            };
+            fr.addEventListener('load', () => {
+                let doc = null;
+                try { doc = fr.contentDocument; } catch (e) { }
+                if (!doc || !doc.body || doc.body.children.length === 0) return;
+                const pending = [...doc.images].filter(i => !i.complete);
+                let went = false;
+                const go = () => {
+                    if (went) return;
+                    went = true;
+                    setTimeout(async () => {
+                        try {
+                            try { await doc.fonts.ready; } catch (e) { }
+                            const fullH = Math.max(doc.body.scrollHeight, doc.documentElement.scrollHeight);
+                            // 控制 canvas 尺寸上限：超长文章自动降低渲染倍率（浏览器 canvas 有维度/面积上限）
+                            let scale = 2;
+                            const MAX_DIM = 30000, MAX_AREA = 140e6;
+                            if (fullH * scale > MAX_DIM) scale = Math.max(1, MAX_DIM / fullH);
+                            if (794 * fullH * scale * scale > MAX_AREA) scale = Math.max(1, Math.sqrt(MAX_AREA / (794 * fullH)));
+                            const canvas = await html2canvas(doc.body, {
+                                scale, width: 794, windowWidth: 794,
+                                backgroundColor: '#ffffff', logging: false, useCORS: true,
+                            });
+                            finish(canvas);
+                        } catch (e) { finish(null, e); }
+                    }, 400);
+                };
+                if (!pending.length) { go(); return; }
+                let left = pending.length;
+                const done = () => { if (--left <= 0) go(); };
+                pending.forEach(i => { i.addEventListener('load', done); i.addEventListener('error', done); });
+                setTimeout(go, 10000);
+            });
+            try {
+                fr.srcdoc = toTrustedHTML(html);
+            } catch (e) {
+                blobURL = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+                fr.src = blobURL;
+            }
+            document.documentElement.appendChild(fr);
+            setTimeout(() => finish(null, new Error('页面渲染超时')), 90000);
+        });
+    }
+
+    // 在目标切割线上方寻找一行"几乎全白"的像素行作为分页点，避免把文字行劈成两半
+    function findBreakY(ctx, canvas, targetY, searchUp, minY) {
+        try {
+            const w = canvas.width;
+            const from = Math.max(minY, targetY - searchUp);
+            if (from >= targetY) return targetY;
+            const data = ctx.getImageData(0, from, w, targetY - from).data;
+            for (let yy = targetY - from - 1; yy >= 0; yy--) {
+                let white = true;
+                for (let x = 0; x < w; x += 6) {           // 横向抽样即可
+                    const o = (yy * w + x) * 4;
+                    if (data[o] < 246 || data[o + 1] < 246 || data[o + 2] < 246) { white = false; break; }
+                }
+                if (white) return from + yy;
+            }
+        } catch (e) { }
+        return targetY;
+    }
+
+    // 长 canvas 按 A4 切页并组装 PDF
+    async function canvasToPDFBlob(canvas, onProgress) {
+        const jsPDFCtor = (typeof jspdf !== 'undefined' && jspdf && jspdf.jsPDF)
+            || (typeof window !== 'undefined' && window.jspdf && window.jspdf.jsPDF);
+        if (!jsPDFCtor) throw new Error('jsPDF 未加载（@require 被禁用？）');
+        const pdf = new jsPDFCtor({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
+        const MARGIN = 10, USABLE_W = 210 - 2 * MARGIN, USABLE_H = 297 - 2 * MARGIN;
+        const pagePx = Math.floor(canvas.width * USABLE_H / USABLE_W);   // 每页对应的源画布高度
+        const ctx = canvas.getContext('2d');
+        const totalPages = Math.max(1, Math.ceil(canvas.height / pagePx));
+        let y = 0, page = 0;
+        while (y < canvas.height && page < 500) {
+            let end = Math.min(y + pagePx, canvas.height);
+            if (end < canvas.height) {
+                end = findBreakY(ctx, canvas, end, Math.floor(pagePx * 0.18), y + Math.floor(pagePx * 0.4));
+            }
+            const sliceH = end - y;
+            const pc = document.createElement('canvas');
+            pc.width = canvas.width;
+            pc.height = sliceH;
+            const pctx = pc.getContext('2d');
+            pctx.fillStyle = '#ffffff';
+            pctx.fillRect(0, 0, pc.width, pc.height);
+            pctx.drawImage(canvas, 0, y, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
+            if (page > 0) pdf.addPage();
+            pdf.addImage(pc.toDataURL('image/jpeg', 0.9), 'JPEG', MARGIN, MARGIN, USABLE_W, USABLE_W * sliceH / canvas.width);
+            y = end;
+            page++;
+            if (onProgress) onProgress(Math.min(page, totalPages), totalPages);
+            await new Promise(r => setTimeout(r, 0));      // 让 UI 有喘息机会
+        }
+        return pdf.output('blob');
+    }
+
+    // Blob 走与 HTML 一致的下载链路（frame 中继 → GM_download → <a download>）
+    async function deliverBlob(blob, fn) {
+        if (IS_FRAME) {
+            if (await relayViaTop({ mode: 'download', fn, blob })) return { via: 'top' };
+            const url = URL.createObjectURL(blob);
+            if (await gmDownloadURL(url, fn)) {
+                setTimeout(() => URL.revokeObjectURL(url), 60000);
+                return { via: 'gm' };
+            }
+            anchorDownload(url, fn);
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            return { via: 'unverified' };
+        }
+        const url = URL.createObjectURL(blob);
+        anchorDownload(url, fn);
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        return { via: 'anchor' };
+    }
+
+    async function exportPDF() {
+        if (busy) { toast('正在处理中，请稍候…'); return; }
+        if (!IS_FRAME && isShellTopPage()) {
+            toast('⚠️ 本页正文位于跨域内嵌页面中，请点击内容区域内的悬浮按钮操作');
+            return;
+        }
+        busy = true;
+        try {
+            toast('正在提取正文…', { sticky: true });
+            await new Promise(r => setTimeout(r, 30));
+            const ex = extractContent();
+            if (!ex) { toast('⚠️ 未能找到可提取的正文'); return; }
+            const meta = getPageMeta(ex.root);
+            const embedInfo = await embedAssets(ex.root, (done, total) => {
+                toast('正在内嵌图片 ' + done + '/' + total + ' …', { sticky: true, progress: total ? done / total : 1 });
+            });
+            const html = buildDoc(ex.root, meta, { embedded: true, forceLight: true });
+            toast('正在渲染页面…', { sticky: true });
+            const canvas = await renderDocToCanvas(html);
+            const blob = await canvasToPDFBlob(canvas, (p, t) => {
+                toast('正在生成 PDF ' + p + '/' + t + ' 页…', { sticky: true, progress: t ? p / t : 1 });
+            });
+            const d = new Date();
+            const ymd = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+            let host = location.hostname;
+            if (IS_FRAME && document.referrer) {
+                try { host = new URL(document.referrer).hostname; } catch (e) { }
+            }
+            host = sanitizeFilename(host.replace(/^[0-9a-f-]{20,}\./i, ''));
+            const fn = sanitizeFilename(meta.title) + '_' + host + '_' + ymd + '.pdf';
+            const { via } = await deliverBlob(blob, fn);
+            const sizeStr = blob.size > 1048576 ? (blob.size / 1048576).toFixed(1) + ' MB' : Math.round(blob.size / 1024) + ' KB';
+            if (via === 'unverified') {
+                toast('⚠️ 已尝试下载 ' + fn + '，但当前内容处于受限沙箱且宿主页面未能代为下载，文件可能未保存。', { duration: 9000 });
+            } else {
+                let msg = '✅ PDF 已保存：' + fn + '（' + sizeStr + '）';
+                if (via === 'top') msg += '（经由宿主页面下载）';
+                if (embedInfo && embedInfo.failedCount) msg += '，' + embedInfo.failedCount + ' 张图片抓取失败';
+                toast(msg, { duration: 7000 });
+            }
+            LOG('pdf saved', fn, sizeStr, 'via=' + via);
+        } catch (e) {
+            WARN(e);
+            toast('❌ PDF 导出失败：' + (e && e.message) + '。可尝试"导出 PDF（打印对话框）"', { duration: 8000 });
         } finally {
             busy = false;
         }
@@ -1242,7 +1440,8 @@
             ['👁', '预览提取结果', () => openPreview()],
             ['📄', '下载 HTML（图片在线引用）', () => saveArticle(false)],
             ['📦', '下载 HTML（图片 Base64 内嵌，离线可用）', () => saveArticle(true)],
-            ['🖨', '导出 PDF（打印对话框中选「另存为 PDF」）', () => exportPDF()],
+            ['🖨', '导出 PDF（自动保存到下载目录）', () => exportPDF()],
+            ['🧾', '导出 PDF（打印对话框，文字可选中）', () => exportPDFViaPrint()],
         ];
         for (const [icon, label, fn] of items) {
             const b = document.createElement('button');
@@ -1380,7 +1579,7 @@
         };
         mk('下载（在线图片）', 'pri', () => { closePreview(); saveArticle(false); });
         mk('下载（内嵌 Base64）', '', () => { closePreview(); saveArticle(true); });
-        mk('导出 PDF', '', () => { closePreview(); exportPDF(); });
+        mk('导出 PDF', '', () => { closePreview(); exportPDF(); });   // 自动保存通道
         mk('✕ 关闭', '', () => closePreview());
         previewFrame = document.createElement('iframe');
         previewFrame.setAttribute('sandbox', '');     // 禁脚本禁同源，纯静态预览
