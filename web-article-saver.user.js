@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Web Article Saver (网页正文提取保存)
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.3.0
-// @description  悬浮按钮一键提取网页纯净正文：剔除广告/侧边栏/评论区/导航等噪音，完整保留图片、SVG、表格、代码块、图表等正文资产；相对路径自动转绝对路径，可选图片 Base64 内嵌（完全离线可读），下载为独立 HTML 文件；PDF 双通道：自动保存到下载目录（html2canvas+jsPDF），或打印对话框导出（文字可选）。支持 claude.ai artifact 等"正文在跨域沙箱 iframe 中"的分享页。快捷键 Alt+Shift+S 快速保存。
+// @version      1.4.0
+// @description  悬浮按钮一键提取网页纯净正文，支持将所有已打开且匹配脚本规则的标签页串行批量保存为 HTML 或 PDF；完整保留图片、SVG、表格、代码块、图表等正文资产，可选图片 Base64 内嵌。支持 claude.ai artifact 等"正文在跨域沙箱 iframe 中"的分享页。快捷键 Alt+Shift+S 快速保存。
 // @author       Anna Su
 // @match        http://*/*
 // @match        https://*/*
@@ -10,6 +10,8 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @grant        GM_download
+// @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @connect      *
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @require      https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js
@@ -21,7 +23,7 @@
     'use strict';
 
     // ---------- 0. 常量与配置 ----------
-    const VERSION = '1.3.0';
+    const VERSION = '1.4.0';
     const LOG = (...a) => console.log('%c[WCX]', 'color:#2563eb;font-weight:600', ...a);
     const WARN = (...a) => console.warn('[WCX]', ...a);
 
@@ -31,6 +33,13 @@
         EMBED_CONCURRENCY: 4,        // Base64 内嵌并发数
         EMBED_TIMEOUT: 30000,        // 单张图片抓取超时 (ms)
         EMBED_MAX_BYTES: 25 * 1024 * 1024, // 单张图片体积上限，超出则保留在线 URL
+        BATCH_DISCOVERY_MS: 3000,    // 收集当前已打开标签页的时间窗口
+        BATCH_TASK_GAP_MS: 1200,     // 串行任务之间留出喘息时间
+        BATCH_START_TIMEOUT: 15000,  // 标签页收到指令后应答超时
+        BATCH_HTML_TIMEOUT: 180000,  // 单个 HTML 任务最长 3 分钟
+        BATCH_PDF_TIMEOUT: 720000,   // 单个 PDF 任务最长 12 分钟
+        BATCH_LEASE_MS: 180000,      // 协调器意外关闭后，3 分钟自动释放残留任务锁
+        BATCH_HEARTBEAT_MS: 30000,   // 协调器/当前 worker 定期续租
     };
 
     // 懒加载图片常见的真实地址属性（按优先级）
@@ -85,6 +94,12 @@
             : null;
     const gmDownload = (typeof GM_download === 'function') ? GM_download
         : (typeof GM !== 'undefined' && GM && typeof GM.download === 'function') ? GM.download
+            : null;
+    const gmSetSharedValue = (typeof GM_setValue === 'function') ? GM_setValue
+        : (typeof GM !== 'undefined' && GM && typeof GM.setValue === 'function') ? GM.setValue.bind(GM)
+            : null;
+    const gmAddSharedValueListener = (typeof GM_addValueChangeListener === 'function') ? GM_addValueChangeListener
+        : (typeof GM !== 'undefined' && GM && typeof GM.addValueChangeListener === 'function') ? GM.addValueChangeListener.bind(GM)
             : null;
     // 是否运行在子 frame 中（claude.ai artifact 等把正文放在跨域沙箱 iframe 里）
     const IS_FRAME = (() => { try { return window.self !== window.top; } catch (e) { return true; } })();
@@ -980,7 +995,7 @@
 
     // 顶层：接收内嵌 frame 的下载请求（带多重防滥用校验）
     function setupTopRelay() {
-        window.addEventListener('message', e => {
+        window.addEventListener('message', async e => {
             const d = e.data;
             if (!d || d.t !== DL_MSG || d.ack || typeof d.fn !== 'string') return;
             const isBlob = (typeof Blob !== 'undefined') && (d.blob instanceof Blob);
@@ -1007,14 +1022,15 @@
             const fn = sanitizeFilename(String(d.fn).replace(/\.(html?|pdf)$/i, '')) + ext;
             const blob = isBlob ? d.blob : new Blob([d.html], { type: 'text/html;charset=utf-8' });
             const url = URL.createObjectURL(blob);
-            anchorDownload(url, fn);
+            const deliveredByGM = await gmDownloadURL(url, fn);
+            if (!deliveredByGM) anchorDownload(url, fn);
             setTimeout(() => URL.revokeObjectURL(url), 60000);
             try { e.source.postMessage({ t: DL_MSG, ack: d.id }, '*'); } catch (err) { }
-            LOG('已代内嵌 frame 下载:', fn);
+            LOG('已代内嵌 frame 下载:', fn, deliveredByGM ? 'via=gm' : 'via=anchor-fallback');
         });
     }
 
-    // 子 frame：请求顶层代执行（mode: 'download' | 'print'），3 秒内收到回执视为成功
+    // 子 frame：请求顶层代执行（mode: 'download' | 'print'），45 秒内收到回执视为成功
     function relayViaTop(payload) {
         return new Promise(resolve => {
             const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -1025,10 +1041,14 @@
             try {
                 window.top.postMessage({ t: DL_MSG, id, mode: payload.mode || 'download', fn: payload.fn, html: payload.html, blob: payload.blob }, '*');
             } catch (e) { finish(false); return; }
-            setTimeout(() => finish(false), 3000);
+            setTimeout(() => finish(false), 45000);
         });
     }
 
+    // 静默下载配置前提：
+    // 1) 浏览器设置中关闭“每次下载都询问保存位置”；
+    // 2) Tampermonkey 高级设置中将“下载模式”设为“浏览器 API”。
+    // 所有自动保存都优先使用 GM_download，并明确 saveAs:false；仅在 API 不可用/失败时才用 <a download> 兜底。
     // GM_download Promise 化：onload/onerror/超时都有明确结果，不再"发射后不管"
     function gmDownloadURL(url, fn) {
         return new Promise(resolve => {
@@ -1043,7 +1063,7 @@
                     ontimeout: () => finish(false),
                 });
             } catch (e) { WARN('GM_download 异常:', e && e.message); finish(false); }
-            setTimeout(() => finish(false), 8000);
+            setTimeout(() => finish(false), 30000);
         });
     }
 
@@ -1073,8 +1093,12 @@
             return { fn, bytes, via: 'unverified' };
         }
 
-        // 顶层：<a download> 直接可用，最可靠
+        // 顶层也统一走 GM_download，确保 saveAs:false 对单页和批量任务行为一致。
         const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+        if (await gmDownloadURL(url, fn)) {
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            return { fn, bytes, via: 'gm' };
+        }
         anchorDownload(url, fn);
         setTimeout(() => URL.revokeObjectURL(url), 60000);
         return { fn, bytes, via: 'anchor' };
@@ -1148,7 +1172,7 @@
             toast('正在提取正文…', { sticky: true });
             await new Promise(r => setTimeout(r, 30));
             const ex = extractContent();
-            if (!ex) { toast('⚠️ 未能找到可提取的正文'); return; }
+            if (!ex) { toast('⚠️ 未能找到可提取的正文'); return false; }
             const meta = getPageMeta(ex.root);
             // 走打印引擎前先内嵌图片：在线图偶发加载失败会在 PDF 里变成空框
             const embedInfo = await embedAssets(ex.root, (done, total) => {
@@ -1314,23 +1338,27 @@
             return { via: 'unverified' };
         }
         const url = URL.createObjectURL(blob);
+        if (await gmDownloadURL(url, fn)) {
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            return { via: 'gm' };
+        }
         anchorDownload(url, fn);
         setTimeout(() => URL.revokeObjectURL(url), 60000);
         return { via: 'anchor' };
     }
 
     async function exportPDF() {
-        if (busy) { toast('正在处理中，请稍候…'); return; }
+        if (busy) { toast('正在处理中，请稍候…'); return false; }
         if (!IS_FRAME && isShellTopPage()) {
             toast('⚠️ 本页正文位于跨域内嵌页面中，请点击内容区域内的悬浮按钮操作');
-            return;
+            return false;
         }
         busy = true;
         try {
             toast('正在提取正文…', { sticky: true });
             await new Promise(r => setTimeout(r, 30));
             const ex = extractContent();
-            if (!ex) { toast('⚠️ 未能找到可提取的正文'); return; }
+            if (!ex) { toast('⚠️ 未能找到可提取的正文'); return false; }
             const meta = getPageMeta(ex.root);
             const embedInfo = await embedAssets(ex.root, (done, total) => {
                 toast('正在内嵌图片 ' + done + '/' + total + ' …', { sticky: true, progress: total ? done / total : 1 });
@@ -1360,19 +1388,352 @@
                 toast(msg, { duration: 7000 });
             }
             LOG('pdf saved', fn, sizeStr, 'via=' + via);
+            return via !== 'unverified';
         } catch (e) {
             WARN(e);
             toast('❌ PDF 导出失败：' + (e && e.message) + '。可尝试"导出 PDF（打印对话框）"', { duration: 8000 });
+            return false;
         } finally {
             busy = false;
         }
     }
 
-    // ---------- 9. UI（悬浮按钮 / 菜单 / 进度提示 / 预览） ----------
+    // ---------- 9. 跨标签页批量下载（GM_setValue 事件总线 + 串行确认队列） ----------
+    // BroadcastChannel 受同源策略限制，无法覆盖不同网站的标签页；Tampermonkey 的共享值监听器
+    // 则以当前 userscript 为作用域，可把指令广播到所有匹配 @match 且已加载本脚本的标签页。
+    const BATCH_BUS_KEY = '__WCX_BATCH_BUS_v1__';
+    const BATCH_PROTOCOL = 1;
+    const TAB_INSTANCE_ID = 'tab-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    const batchSeenMessageIds = new Set();
+    let batchMessagingReady = false;
+    let batchReservedJobId = null;
+    let batchReservationUntil = 0;
+    let batchWorkerJobId = null;
+    let activeBatchCoordinator = null;
+
+    function makeBatchId(prefix) {
+        return prefix + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    }
+
+    function rememberBatchMessage(messageId) {
+        if (!messageId || batchSeenMessageIds.has(messageId)) return false;
+        batchSeenMessageIds.add(messageId);
+        if (batchSeenMessageIds.size > 500) {
+            batchSeenMessageIds.delete(batchSeenMessageIds.values().next().value);
+        }
+        return true;
+    }
+
+    function publishBatchMessage(payload) {
+        const message = Object.assign({}, payload, {
+            protocol: BATCH_PROTOCOL,
+            messageId: makeBatchId('msg'),
+            senderId: TAB_INSTANCE_ID,
+            sentAt: Date.now(),
+        });
+        // GM_setValue 的发起实例不一定触发自己的 change listener，因此显式本地分发一次。
+        handleBatchMessage(message);
+        try {
+            const pending = gmSetSharedValue && gmSetSharedValue(BATCH_BUS_KEY, JSON.stringify(message));
+            if (pending && typeof pending.catch === 'function') {
+                pending.catch(e => WARN('批量消息发送失败:', e && e.message));
+            }
+        } catch (e) {
+            WARN('批量消息发送失败:', e && e.message);
+        }
+        return message;
+    }
+
+    function batchParticipantEligible() {
+        if (!document.body) return false;
+        if (!IS_FRAME) return !isShellTopPage();
+        // 顶层外壳页不参与，真正含正文且已挂载 UI 的跨域 frame 作为该浏览器标签页的 worker。
+        return !!(fab && fab.isConnected && frameEligible() && frameHasContent());
+    }
+
+    function setupBatchMessaging() {
+        if (batchMessagingReady || !gmSetSharedValue || !gmAddSharedValueListener) return;
+        batchMessagingReady = true;
+        try {
+            gmAddSharedValueListener(BATCH_BUS_KEY, (_name, _oldValue, newValue) => {
+                try {
+                    const message = typeof newValue === 'string' ? JSON.parse(newValue) : newValue;
+                    handleBatchMessage(message);
+                } catch (e) {
+                    WARN('忽略无法解析的批量消息:', e && e.message);
+                }
+            });
+        } catch (e) {
+            batchMessagingReady = false;
+            WARN('跨标签页监听初始化失败:', e && e.message);
+        }
+    }
+
+    function handleBatchMessage(message) {
+        if (!message || message.protocol !== BATCH_PROTOCOL || !rememberBatchMessage(message.messageId)) return;
+        if (!message.jobId || !message.type) return;
+        if (message.sentAt && Math.abs(Date.now() - message.sentAt) > 30 * 60 * 1000) return;
+
+        if (batchReservedJobId === message.jobId) {
+            batchReservationUntil = Date.now() + CFG.BATCH_LEASE_MS;
+        }
+        if (message.type === 'heartbeat') return;
+
+        if (message.type === 'discover') {
+            if (!batchParticipantEligible()) return;
+            if (batchReservedJobId && batchReservedJobId !== message.jobId && Date.now() < batchReservationUntil) return;
+            batchReservedJobId = message.jobId;
+            batchReservationUntil = Date.now() + CFG.BATCH_LEASE_MS;
+            // 发现阶段立即应答：后台标签页的 setTimeout 可能被浏览器节流到一分钟，不能依赖它做登记。
+            publishBatchMessage({
+                type: 'ready',
+                jobId: message.jobId,
+                mode: message.mode,
+                title: String(document.title || location.hostname || '未命名页面').slice(0, 160),
+                url: location.href,
+                tabKey: (IS_FRAME && document.referrer) ? document.referrer : location.href,
+                isFrame: IS_FRAME,
+            });
+            return;
+        }
+
+        if (message.type === 'ready') {
+            const job = activeBatchCoordinator;
+            if (!job || job.jobId !== message.jobId || job.phase !== 'discovering') return;
+            job.participants.set(message.senderId, {
+                tabId: message.senderId,
+                title: message.title || message.url || '未命名页面',
+                url: message.url || '',
+                tabKey: message.tabKey || message.url || message.senderId,
+                isFrame: !!message.isFrame,
+            });
+            return;
+        }
+
+        if (message.type === 'run') {
+            if (message.targetId !== TAB_INSTANCE_ID || batchReservedJobId !== message.jobId) return;
+            // 过期指令绝不补跑，防止休眠标签页很晚才醒来并与后续 worker 重叠。
+            if (message.expiresAt && Date.now() > message.expiresAt) return;
+            if (batchWorkerJobId) return;
+            batchWorkerJobId = message.jobId;
+            publishBatchMessage({ type: 'started', jobId: message.jobId, mode: message.mode });
+            void executeBatchWorker(message);
+            return;
+        }
+
+        if (message.type === 'started') {
+            onBatchWorkerStarted(message);
+            return;
+        }
+
+        if (message.type === 'done') {
+            onBatchWorkerDone(message);
+            return;
+        }
+
+        if (message.type === 'finish' && batchReservedJobId === message.jobId) {
+            batchReservedJobId = null;
+            batchReservationUntil = 0;
+        }
+    }
+
+    async function executeBatchWorker(command) {
+        let ok = false;
+        let error = '';
+        const heartbeatTimer = setInterval(() => {
+            publishBatchMessage({ type: 'heartbeat', jobId: command.jobId, mode: command.mode });
+        }, CFG.BATCH_HEARTBEAT_MS);
+        try {
+            // 即使已有严格串行确认，也额外随机等待 1–5 秒，让页面布局/浏览器资源有时间稳定。
+            const jitter = 1000 + Math.floor(Math.random() * 4001);
+            toast('批量任务已排队，' + Math.ceil(jitter / 1000) + ' 秒后开始…', { sticky: true });
+            await new Promise(resolve => setTimeout(resolve, jitter));
+            ok = command.mode === 'pdf' ? await exportPDF() : await saveArticle(false);
+            if (!ok) error = '保存流程未确认成功';
+        } catch (e) {
+            error = e && e.message ? e.message : String(e);
+            WARN('批量任务执行失败:', e);
+        } finally {
+            clearInterval(heartbeatTimer);
+            publishBatchMessage({
+                type: 'done',
+                jobId: command.jobId,
+                mode: command.mode,
+                ok: !!ok,
+                error,
+            });
+            batchWorkerJobId = null;
+        }
+    }
+
+    function startBatchDownload(mode) {
+        if (mode !== 'html' && mode !== 'pdf') return;
+        if (!gmSetSharedValue || !gmAddSharedValueListener) {
+            toast('❌ 当前 Tampermonkey 未提供 GM_setValue / GM_addValueChangeListener，无法跨标签页批量下载。', { duration: 8000 });
+            return;
+        }
+        setupBatchMessaging();
+        if (!batchMessagingReady) {
+            toast('❌ 跨标签页通信初始化失败，请检查 Tampermonkey 权限。', { duration: 8000 });
+            return;
+        }
+        if (activeBatchCoordinator) {
+            toast('已有批量任务正在运行，请等待它完成。');
+            return;
+        }
+
+        const jobId = makeBatchId('job');
+        activeBatchCoordinator = {
+            jobId,
+            mode,
+            phase: 'discovering',
+            participants: new Map(),
+            queue: [],
+            index: 0,
+            current: null,
+            results: [],
+            heartbeatTimer: null,
+        };
+        activeBatchCoordinator.heartbeatTimer = setInterval(() => {
+            const job = activeBatchCoordinator;
+            if (job && job.jobId === jobId) {
+                publishBatchMessage({ type: 'heartbeat', jobId, mode });
+            }
+        }, CFG.BATCH_HEARTBEAT_MS);
+        toast('正在发现所有已打开且匹配脚本规则的标签页…', { sticky: true });
+        publishBatchMessage({ type: 'discover', jobId, mode });
+        setTimeout(() => finalizeBatchDiscovery(jobId), CFG.BATCH_DISCOVERY_MS);
+    }
+
+    function finalizeBatchDiscovery(jobId) {
+        const job = activeBatchCoordinator;
+        if (!job || job.jobId !== jobId || job.phase !== 'discovering') return;
+        job.phase = 'running';
+        // 同一浏览器标签页可能同时注入顶层和跨域 frame；按父页面 URL 去重，并优先顶层 worker。
+        const participantsByTab = new Map();
+        for (const participant of job.participants.values()) {
+            const previous = participantsByTab.get(participant.tabKey);
+            if (!previous || (previous.isFrame && !participant.isFrame)) {
+                participantsByTab.set(participant.tabKey, participant);
+            }
+        }
+        job.queue = [...participantsByTab.values()].sort((a, b) => {
+            if (a.tabId === TAB_INSTANCE_ID) return -1;
+            if (b.tabId === TAB_INSTANCE_ID) return 1;
+            return String(a.title).localeCompare(String(b.title));
+        });
+        if (!job.queue.length) {
+            finishBatchCoordinator(false, '没有发现可执行的标签页；请确认目标页已加载本脚本。');
+            return;
+        }
+        LOG('批量任务发现 ' + job.queue.length + ' 个页面', job.queue);
+        dispatchNextBatchTask();
+    }
+
+    function dispatchNextBatchTask() {
+        const job = activeBatchCoordinator;
+        if (!job || job.phase !== 'running' || job.current) return;
+        if (job.index >= job.queue.length) {
+            finishBatchCoordinator(false);
+            return;
+        }
+
+        const target = job.queue[job.index];
+        const current = {
+            target,
+            startTimer: null,
+            executionTimer: null,
+        };
+        job.current = current;
+        current.startTimer = setTimeout(() => {
+            const liveJob = activeBatchCoordinator;
+            if (!liveJob || liveJob.jobId !== job.jobId || liveJob.current !== current) return;
+            liveJob.results.push({ tabId: target.tabId, title: target.title, ok: false, error: '标签页未确认开始' });
+            liveJob.current = null;
+            liveJob.index++;
+            toast('⚠️ 第 ' + liveJob.index + '/' + liveJob.queue.length + ' 页无响应，继续下一个…', { sticky: true });
+            setTimeout(dispatchNextBatchTask, CFG.BATCH_TASK_GAP_MS);
+        }, CFG.BATCH_START_TIMEOUT);
+
+        toast('批量' + (job.mode === 'pdf' ? ' PDF' : ' HTML') + '：等待第 '
+            + (job.index + 1) + '/' + job.queue.length + ' 页开始…', { sticky: true });
+        publishBatchMessage({
+            type: 'run',
+            jobId: job.jobId,
+            mode: job.mode,
+            targetId: target.tabId,
+            expiresAt: Date.now() + CFG.BATCH_START_TIMEOUT,
+        });
+    }
+
+    function onBatchWorkerStarted(message) {
+        const job = activeBatchCoordinator;
+        if (!job || job.jobId !== message.jobId || !job.current) return;
+        if (job.current.target.tabId !== message.senderId) return;
+        clearTimeout(job.current.startTimer);
+        const current = job.current;
+        const timeout = job.mode === 'pdf' ? CFG.BATCH_PDF_TIMEOUT : CFG.BATCH_HTML_TIMEOUT;
+        current.executionTimer = setTimeout(() => {
+            const liveJob = activeBatchCoordinator;
+            if (!liveJob || liveJob.jobId !== job.jobId || liveJob.current !== current) return;
+            liveJob.results.push({
+                tabId: current.target.tabId,
+                title: current.target.title,
+                ok: false,
+                error: '执行超时，为避免并发已停止整批任务',
+            });
+            finishBatchCoordinator(true, '当前页面执行超时；为避免多个重任务并发，批量任务已停止。');
+        }, timeout);
+        toast('批量' + (job.mode === 'pdf' ? ' PDF' : ' HTML') + '：正在处理第 '
+            + (job.index + 1) + '/' + job.queue.length + ' 页…', { sticky: true });
+    }
+
+    function onBatchWorkerDone(message) {
+        const job = activeBatchCoordinator;
+        if (!job || job.jobId !== message.jobId || !job.current) return;
+        if (job.current.target.tabId !== message.senderId) return;
+        clearTimeout(job.current.startTimer);
+        clearTimeout(job.current.executionTimer);
+        job.results.push({
+            tabId: message.senderId,
+            title: job.current.target.title,
+            ok: !!message.ok,
+            error: message.error || '',
+        });
+        job.current = null;
+        job.index++;
+        const succeeded = job.results.filter(result => result.ok).length;
+        toast('批量进度 ' + job.index + '/' + job.queue.length + '（成功 ' + succeeded + '）', { sticky: true });
+        setTimeout(dispatchNextBatchTask, CFG.BATCH_TASK_GAP_MS);
+    }
+
+    function finishBatchCoordinator(aborted, reason) {
+        const job = activeBatchCoordinator;
+        if (!job) return;
+        if (job.current) {
+            clearTimeout(job.current.startTimer);
+            clearTimeout(job.current.executionTimer);
+        }
+        clearInterval(job.heartbeatTimer);
+        const total = job.queue.length;
+        const succeeded = job.results.filter(result => result.ok).length;
+        const failed = Math.max(0, total - succeeded);
+        const jobId = job.jobId;
+        activeBatchCoordinator = null;
+        publishBatchMessage({ type: 'finish', jobId, mode: job.mode, aborted: !!aborted });
+        if (reason) {
+            toast('⚠️ ' + reason + ' 已成功 ' + succeeded + '，失败/跳过 ' + failed + '。', { duration: 10000 });
+        } else {
+            toast('✅ 批量任务完成：共 ' + total + ' 页，成功 ' + succeeded + '，失败/跳过 ' + failed + '。', { duration: 10000 });
+        }
+        LOG('批量任务结束', { total, succeeded, failed, aborted: !!aborted, results: job.results });
+    }
+
+    // ---------- 10. UI（悬浮按钮 / 菜单 / 进度提示 / 预览） ----------
     const UI_CSS = [
         '#__WCX_FAB__{position:fixed;right:22px;bottom:92px;width:48px;height:48px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;box-shadow:0 6px 16px rgba(0,0,0,.28);cursor:pointer;z-index:2147483645;user-select:none;transition:transform .15s;touch-action:none}',
         '#__WCX_FAB__:hover{transform:scale(1.08)}',
-        '#__WCX_MENU__{position:fixed;min-width:230px;background:#fff;border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.28);z-index:2147483646;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;display:none;flex-direction:column;color:#1f2328}',
+        '#__WCX_MENU__{position:fixed;min-width:280px;background:#fff;border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.28);z-index:2147483646;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;display:none;flex-direction:column;color:#1f2328}',
         '#__WCX_MENU__ .hd{padding:10px 14px;font-size:12px;color:#666;border-bottom:1px solid #eee;background:#fafafa}',
         '#__WCX_MENU__ button{display:flex;align-items:center;gap:9px;width:100%;border:0;background:#fff;padding:11px 14px;font-size:13px;cursor:pointer;text-align:left;color:#1f2328}',
         '#__WCX_MENU__ button:hover{background:#f2f6ff}',
@@ -1441,6 +1802,8 @@
             ['📄', '下载 HTML（图片在线引用）', () => saveArticle(false)],
             ['📦', '下载 HTML（图片 Base64 内嵌，离线可用）', () => saveArticle(true)],
             ['🖨', '导出 PDF（自动保存到下载目录）', () => exportPDF()],
+            ['🗂️', '批量下载全部标签页 (HTML)', () => startBatchDownload('html')],
+            ['📚', '批量下载全部标签页 (PDF)', () => startBatchDownload('pdf')],
             ['🧾', '导出 PDF（打印对话框，文字可选中）', () => exportPDFViaPrint()],
         ];
         for (const [icon, label, fn] of items) {
@@ -1542,7 +1905,7 @@
         fab.style.bottom = 'auto';
     }
 
-    // ---------- 10. 预览 ----------
+    // ---------- 11. 预览 ----------
     // Trusted Types 兼容：优先 srcdoc（不受 frame-src CSP 限制），策略被禁则回退 blob URL
     let ttPolicy = null, ttTried = false;
     function toTrustedHTML(s) {
@@ -1637,19 +2000,19 @@
         if (previewURL) { URL.revokeObjectURL(previewURL); previewURL = null; }
     }
 
-    // ---------- 11. 主流程 ----------
+    // ---------- 12. 主流程 ----------
     async function saveArticle(embed) {
-        if (busy) { toast('正在处理中，请稍候…'); return; }
+        if (busy) { toast('正在处理中，请稍候…'); return false; }
         if (!IS_FRAME && isShellTopPage()) {
             toast('⚠️ 本页正文位于跨域内嵌页面中，请点击内容区域内的悬浮按钮操作（或先点击内容再按 Alt+Shift+S）');
-            return;
+            return false;
         }
         busy = true;
         try {
             toast('正在提取正文…', { sticky: true });
             await new Promise(r => setTimeout(r, 30));    // 让 toast 先渲染
             const ex = extractContent();
-            if (!ex) { toast('⚠️ 未能找到可提取的正文'); return; }
+            if (!ex) { toast('⚠️ 未能找到可提取的正文'); return false; }
             const meta = getPageMeta(ex.root);
             if (ex.usedFallback) LOG('未找到明显正文候选，回退为整页主体');
 
@@ -1677,15 +2040,17 @@
                 toast(msg, { duration: 6000 });
             }
             LOG('saved', fn, sizeStr, 'via=' + via, embedInfo || '');
+            return via !== 'unverified';
         } catch (e) {
             WARN(e);
             toast('❌ 保存失败：' + (e && e.message));
+            return false;
         } finally {
             busy = false;
         }
     }
 
-    // ---------- 12. 初始化 ----------
+    // ---------- 13. 初始化 ----------
     // "外壳页"判定：顶层自身几乎没有正文，且被一个大型跨域 iframe 覆盖
     // （claude.ai artifact 分享页即此结构——正文在 *.claudeusercontent.com 沙箱 iframe 里，
     //   脚本会在那个 iframe 内单独挂载按钮，顶层按钮只会误存外壳，故隐藏）
@@ -1755,6 +2120,8 @@
     }
 
     function init() {
+        // 外壳页也必须监听批量总线；它不会作为 worker 响应，但能继续为内容 frame 中继下载。
+        setupBatchMessaging();
         if (IS_FRAME) initFrameMode();
         else initTopMode();
     }
