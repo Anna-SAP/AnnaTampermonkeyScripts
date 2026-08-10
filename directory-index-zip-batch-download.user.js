@@ -2,7 +2,7 @@
 // @name         Directory Index ZIP Batch Download
 // @name:zh-CN   目录索引页 ZIP 批量下载
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.1.0
+// @version      1.2.0
 // @description  Add a floating button to standard web directory index pages that batch-downloads every linked .zip file with staggered, throttled triggers.
 // @description:zh-CN 在标准 Web 目录索引页（如 nginx autoindex）注入浮动按钮，一键批量下载页面内全部 .zip 文件，错峰触发以规避浏览器并发下载限制与弹窗拦截。
 // @author       Anna-SAP
@@ -245,7 +245,17 @@
 
     async function runBatch(items) {
         const total = items.length;
-        const canUseGmDownload = typeof GM_download === 'function';
+        // GM_download is only trusted in Browser API download mode. In
+        // Tampermonkey's Native mode the transfer is streamed through a
+        // blob: URL and the browser names the saved file after the blob UUID
+        // (hash-like *.zip) instead of the requested name, so the same-origin
+        // <a download> path — which always keeps the real file name — is
+        // used for every other mode.
+        const downloadMode = typeof GM_info === 'object' && GM_info !== null
+            ? GM_info.downloadMode
+            : undefined;
+        const canUseGmDownload = typeof GM_download === 'function'
+            && (downloadMode === undefined || downloadMode === 'browser');
         let inFlight = 0;
         let settledCount = 0;
         let failedCount = 0;
