@@ -2,13 +2,13 @@
 // @name         GitLab Code Word Wrap Toggle
 // @name:zh-CN   GitLab 代码一键折行
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.0
-// @description  Add a persistent one-click word-wrap toggle to GitLab repository file views.
-// @description:zh-CN 为 GitLab 代码查看页面添加记忆状态的一键折行开关，免除长代码行的横向滚动。
+// @version      1.0.1
+// @description  Add a persistent one-click word-wrap toggle to GitLab repository file and blame views.
+// @description:zh-CN 为 GitLab 代码及追溯页面添加记忆状态的一键折行开关，免除长代码行的横向滚动。
 // @author       Anna-SAP
 // @match        https://git.ringcentral.com/*
 // @match        https://gitlab.com/*
-// @include      /^https?:\/\/[^/]+\/.*\/-\/blob\/.*/
+// @include      /^https?:\/\/[^/]+\/.*\/-\/(?:blob|blame)\/.*/
 // @icon         https://gitlab.com/favicon.ico
 // @run-at       document-idle
 // @grant        none
@@ -28,11 +28,12 @@
     const HEIGHT_VAR = '--tm-glww-line-height';
     const STORAGE_KEY = 'tm.gitlab.wordWrap.enabled.v1';
     const DEFAULT_ENABLED = true;
-    const BLOB_PATH_RE = /\/-\/blob\/.+/;
+    const CODE_VIEW_PATH_RE = /\/-\/(?:blob|blame)\/.+/;
     const VIEWER_SELECTOR = [
         '[data-testid="blob-viewer-file-content"]',
         '[data-qa-selector="blob_viewer_file_content"]',
         '.blob-viewer[data-type="simple"]',
+        '.file-content.blame.code',
         '.file-content.code[data-type="simple"]',
         '#blob-content-holder .blob-content',
     ].join(', ');
@@ -84,8 +85,8 @@
         }
     }
 
-    function isBlobPage() {
-        return BLOB_PATH_RE.test(location.pathname);
+    function isCodeViewPage() {
+        return CODE_VIEW_PATH_RE.test(location.pathname);
     }
 
     function injectStyles() {
@@ -106,6 +107,14 @@
                 overflow-x: hidden !important;
             }
 
+            .${SHELL_CLASS} :is(.blame-table, .blame-table-wrapper) {
+                box-sizing: border-box !important;
+                width: 100% !important;
+                min-width: 0 !important;
+                max-width: 100% !important;
+                overflow-x: hidden !important;
+            }
+
             .${VIEWER_CLASS} pre {
                 box-sizing: border-box !important;
                 width: 100% !important;
@@ -121,6 +130,30 @@
                 width: auto !important;
                 min-width: 0 !important;
                 max-width: 100% !important;
+                white-space: pre-wrap !important;
+                overflow-wrap: anywhere !important;
+                word-break: break-word !important;
+            }
+
+            .${VIEWER_CLASS}.blame > table {
+                box-sizing: border-box !important;
+                width: 100% !important;
+                max-width: 100% !important;
+            }
+
+            .${VIEWER_CLASS}.blame .tr {
+                box-sizing: border-box !important;
+                width: 100% !important;
+                min-width: 0 !important;
+                max-width: 100% !important;
+            }
+
+            .${VIEWER_CLASS}.blame .lines {
+                box-sizing: border-box !important;
+                flex: 1 1 0 !important;
+                min-width: 0 !important;
+                max-width: 100% !important;
+                overflow-x: hidden !important;
             }
 
             .${VIEWER_CLASS} :is(
@@ -414,7 +447,7 @@
     }
 
     function syncAllLineHeights() {
-        if (!enabled || !isBlobPage()) return;
+        if (!enabled || !isCodeViewPage()) return;
         document.querySelectorAll(`.${VIEWER_CLASS}`).forEach(syncWrappedLineHeights);
     }
 
@@ -430,8 +463,8 @@
     function reconcilePage() {
         injectStyles();
 
-        const onBlobPage = isBlobPage();
-        const viewers = onBlobPage ? findViewers() : [];
+        const onCodeViewPage = isCodeViewPage();
+        const viewers = onCodeViewPage ? findViewers() : [];
 
         if (enabled && viewers.length > 0) {
             applyDecorations(viewers);
@@ -440,7 +473,7 @@
             clearDecorations();
         }
 
-        if (onBlobPage && viewers.length > 0) {
+        if (onCodeViewPage && viewers.length > 0) {
             updateButton(createButton());
         } else {
             document.getElementById(BUTTON_ID)?.remove();
