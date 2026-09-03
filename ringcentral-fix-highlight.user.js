@@ -2,9 +2,9 @@
 // @name         RingCentral Highlight [FIX]
 // @name:zh-CN   RingCentral 高亮 [FIX] 消息
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.1
-// @description  Highlight the inner RingCentral Adaptive Card (not the full message row) when it contains [FIX]. Covers initial load and live incoming messages.
-// @description:zh-CN  实时查找包含关键字 [FIX] 的 RingCentral 消息，仅将红框内的自适应卡片背景标为黄色，而不是整行铺黄。
+// @version      1.0.2
+// @description  Highlight the inner RingCentral Adaptive Card (not the full message row) when it contains [FIX] or [BATCH_FIX]. Covers initial load and live incoming messages.
+// @description:zh-CN  实时查找包含关键字 [FIX] 或 [BATCH_FIX] 的 RingCentral 消息，仅将内层自适应卡片背景标为黄色，而不是整行铺黄。
 // @author       Anna-SAP
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    const KEYWORD = '[FIX]';
+    const KEYWORDS = ['[FIX]', '[BATCH_FIX]'];
     const STYLE_ID = '__TM_RC_FIX_HL_STYLE__';
     const HL_CLASS = 'tm-rc-fix-hl';
     const MESSAGES_PATH_RE = /\/messages(\/|$)/;
@@ -63,11 +63,19 @@
         return MESSAGES_PATH_RE.test(location.pathname || '');
     }
 
+    function containsKeyword(text) {
+        if (!text) return false;
+        for (let i = 0; i < KEYWORDS.length; i++) {
+            if (text.indexOf(KEYWORDS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
     function findKeywordTextHost(card) {
         const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT, null);
         let node;
         while ((node = walker.nextNode())) {
-            if ((node.nodeValue || '').indexOf(KEYWORD) !== -1) {
+            if (containsKeyword(node.nodeValue)) {
                 return node.parentElement;
             }
         }
@@ -106,7 +114,7 @@
         let foundAdaptive = false;
         for (let i = 0; i < adaptives.length; i++) {
             const el = adaptives[i];
-            if ((el.textContent || '').indexOf(KEYWORD) === -1) continue;
+            if (!containsKeyword(el.textContent)) continue;
             foundAdaptive = true;
             add(outermostCompactAncestor(el, card) || el);
         }
@@ -120,7 +128,7 @@
     function applyCard(card) {
         if (!card || card.nodeType !== 1) return;
 
-        const hit = (card.textContent || '').indexOf(KEYWORD) !== -1;
+        const hit = containsKeyword(card.textContent);
         const targets = hit ? findHighlightTargets(card) : [];
         const keep = new Set(targets);
 
