@@ -2,9 +2,9 @@
 // @name         RingCentral Avatar Role Badges
 // @name:zh-CN   RingCentral 头像角色标签
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.0
-// @description  Overlay short role tags (QA, PM, TL, AVP, EVP, …) on people avatars in RingCentral Messages. Titles come from Glip IndexedDB, directory API responses, and profile popovers.
-// @description:zh-CN  在 RingCentral 网页聊天（/messages）里，根据职位/部门给用户头像叠上短角色标签（QA、PM、TL、AVP、EVP 等）。数据来自 Glip IndexedDB、目录接口和资料浮层。
+// @version      1.1.0
+// @description  Overlay short role tags (QA, L10N, PM, TL, GVP, EVP, …) on people avatars in RingCentral Messages. Titles come from Glip IndexedDB, directory API responses, and profile popovers.
+// @description:zh-CN  在 RingCentral 网页聊天（/messages）里，根据职位/部门给用户头像叠上短角色标签（QA、L10N、PM、TL、GVP、EVP 等）。数据来自 Glip IndexedDB、目录接口和资料浮层。
 // @author       Anna-SAP
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const STYLE_ID = '__TM_RC_ROLE_STYLE__';
     const HOST_CLASS = 'tm-rc-role-host';
     const HOST_SM_CLASS = 'tm-rc-role-sm';
@@ -51,13 +51,15 @@
     const ROLE_THEME = {
         CEO: ['#111827', '#fff'], CTO: ['#111827', '#fff'], CFO: ['#111827', '#fff'],
         COO: ['#111827', '#fff'], CPO: ['#111827', '#fff'], CXO: ['#111827', '#fff'],
-        EVP: ['#6b21a8', '#fff'], SVP: ['#7e22ce', '#fff'], AVP: ['#7e22ce', '#fff'],
+        PRES: ['#111827', '#fff'], GM: ['#1f2937', '#fff'],
+        EVP: ['#6b21a8', '#fff'], GVP: ['#86198f', '#fff'],
+        SVP: ['#7e22ce', '#fff'], AVP: ['#7e22ce', '#fff'],
         VP: ['#6d28d9', '#fff'],
         DIR: ['#3730a3', '#fff'], MGR: ['#1d4ed8', '#fff'], TL: ['#0369a1', '#fff'],
         QA: ['#0f766e', '#fff'], PM: ['#c2410c', '#fff'], PO: ['#c2410c', '#fff'],
         PjM: ['#b45309', '#fff'], PgM: ['#b45309', '#fff'],
         L10N: ['#be185d', '#fff'], UX: ['#9d174d', '#fff'],
-        DATA: ['#0e7490', '#fff'], SEC: ['#b91c1c', '#fff'],
+        DATA: ['#0e7490', '#fff'], AI: ['#155e75', '#fff'], SEC: ['#b91c1c', '#fff'],
         OPS: ['#334155', '#fff'], DEVOPS: ['#334155', '#fff'],
         ENG: ['#475569', '#fff'], ARCH: ['#1e3a5f', '#fff'],
         HR: ['#7c2d12', '#fff'], FIN: ['#166534', '#fff'],
@@ -70,55 +72,62 @@
     const DEFAULT_THEME = ['#475569', '#fff'];
 
     // Rank (title only) that always wins — exec identity matters more than function.
+    // Order matters: GVP/SVP/AVP/EVP before VP ("group vice president" contains
+    // "vice president"), VP before PRES ("vice president" contains "president").
     const RANK_EXEC = [
-        { tag: 'CEO', re: /\bchief\s+executive\b|\bceo\b/ },
-        { tag: 'CTO', re: /\bchief\s+technology\b|\bcto\b/ },
-        { tag: 'CFO', re: /\bchief\s+financial\b|\bcfo\b/ },
-        { tag: 'COO', re: /\bchief\s+operating\b|\bcoo\b/ },
-        { tag: 'CPO', re: /\bchief\s+product\b|\bcpo\b/ },
-        { tag: 'CXO', re: /\bchief\b.+\bofficer\b/ },
+        { tag: 'CEO', re: /\bchief\s+executive\b|\bceo\b|首席执行官/ },
+        { tag: 'CTO', re: /\bchief\s+technology\b|\bcto\b|首席技术官/ },
+        { tag: 'CFO', re: /\bchief\s+financial\b|\bcfo\b|首席财务官/ },
+        { tag: 'COO', re: /\bchief\s+operating\b|\bcoo\b|首席运营官/ },
+        { tag: 'CPO', re: /\bchief\s+product\b|\bcpo\b|首席产品官/ },
+        { tag: 'CXO', re: /\bchief\b.+\bofficer\b|\bc(?:i|m|r|d|a|c|s|hr|is)o\b|首席\S{0,4}官/ },
         { tag: 'EVP', re: /\bexec(?:utive)?\s+vice\s+president\b|\bevp\b|执行副总裁/ },
-        { tag: 'SVP', re: /\bsenior\s+vice\s+president\b|\bsvp\b/ },
+        { tag: 'GVP', re: /\bgroup\s+vice\s+president\b|\bgvp\b/ },
+        { tag: 'SVP', re: /\bs(?:enio)?r\.?\s+vice\s+president\b|\bsvp\b|高级副总裁/ },
         { tag: 'AVP', re: /\b(?:assistant|associate)\s+vice\s+president\b|\bavp\b|助理副总裁/ },
         { tag: 'VP', re: /\bvice\s+president\b|\bvp\b|副总裁|副总经理/ },
+        { tag: 'PRES', re: /\bpresident\b|总裁/ },
+        { tag: 'GM', re: /\bgeneral\s+manager\b|\bgm\b|总经理/ },
     ];
 
     // Distinctive function — wins over manager/lead/director.
     // "QA Team Lead" → QA; "Team Lead" in Quality Assurance → QA; "Team Lead" otherwise → TL.
     const FUNC_RULES = [
-        { tag: 'QA', re: /\bqa\b|\bq\.a\.?\b|\bquality\s+assurance\b|\bquality\s+engineer\b|\bsdet\b|\bqa\s*lead\b|\btest(?:er|ing)?\b|测试|质量保证|品质保证/ },
-        { tag: 'L10N', re: /\bl10n\b|\bi18n\b|\blocalization\b|\blocalisation\b|\btranslator\b|\blinguist\b|\btranslation\b|本地化|翻译/ },
-        { tag: 'PM', re: /\bproduct\s+(?:manager|owner|lead|director)\b|\bproduct\s+mgmt\b|\b\bpm\b|产品经理|产品负责人|产品总监/ },
-        { tag: 'PO', re: /\bproduct\s+owner\b|\b\bpo\b/ },
-        { tag: 'PjM', re: /\bproject\s+manager\b|\bproject\s+mgmt\b|\bpmo\b|项目经理/ },
-        { tag: 'PgM', re: /\bprogram\s+manager\b|项目群经理|项目组合/ },
-        { tag: 'UX', re: /\bux\b|\bui\/ux\b|\bproduct\s+design(?:er)?\b|\b(?:ui|ux|visual|interaction)\s+design(?:er)?\b|\bdesigner\b/ },
-        { tag: 'DATA', re: /\bdata\s+(?:scien\w*|analy\w*|engineer)\b|\bmachine\s+learning\b|\b\bml\b|\bai\s+engineer\b/ },
-        { tag: 'SEC', re: /\b(?:info(?:rmation)?\s+)?security\b|\bappsec\b|\binfosec\b|\bsecops\b/ },
-        { tag: 'DEVOPS', re: /\bdev\s*ops\b|\bsre\b|\bsite\s+reliability\b/ },
-        { tag: 'OPS', re: /\boperations?\b|\bsysadmin\b/ },
-        { tag: 'HR', re: /\bhuman\s+resources\b|\b\bhr\b|\bpeople\s+(?:ops|partner|business)\b|\brecruiter\b|\btalent\s+acquisition\b/ },
-        { tag: 'FIN', re: /\bfinanc(?:e|ial)\b|\baccount(?:ant|ing)\b|\bcontroller\b|\bpayroll\b/ },
-        { tag: 'CS', re: /\bcustomer\s+success\b|\bsupport\s+(?:engineer|agent|specialist)\b|\btechnical\s+support\b|\bhelpdesk\b/ },
-        { tag: 'SALES', re: /\bsales\b|\baccount\s+executive\b|\bsolutions?\s+(?:consultant|engineer)\b/ },
-        { tag: 'MKT', re: /\bmarket(?:ing|er)\b|\bdemand\s+gen/ },
-        { tag: 'LEGAL', re: /\blegal\b|\bcounsel\b|\battorney\b|\bcompliance\b/ },
+        { tag: 'QA', re: /\bqa\b|\bq\.a\.?\b|\bquality\s+(?:assurance|engineer(?:ing)?|management|analyst)\b|\bsdet\b|\btest(?:er|ing)?\b|测试|质量保证|品质保证/ },
+        { tag: 'L10N', re: /\bl10n\b|\bi18n\b|\bg11n\b|\blocali[sz]ation\b|\bglobali[sz]ation\b|\binternationali[sz]ation\b|\btranslat(?:e|or|ion)\b|\blinguist\b|\blanguage\s+(?:lead|specialist|manager|expert|quality|team|services?)\b|本地化|国际化|翻译/ },
+        { tag: 'PM', re: /\bproduct\s+(?:manager|management|mgmt|owner|lead|director)\b|\bpm\b|产品经理|产品负责人|产品总监/ },
+        { tag: 'PO', re: /\bproduct\s+owner\b|\bpo\b/ },
+        { tag: 'PjM', re: /\bproject\s+(?:manager|management|mgmt)\b|\bpmo\b|项目经理/ },
+        { tag: 'PgM', re: /\bprogram\s+(?:manager|management|mgmt)\b|\btpm\b|项目群经理|项目组合/ },
+        { tag: 'UX', re: /\bux\b|\bui\/ux\b|\bproduct\s+design(?:er)?\b|\b(?:ui|ux|visual|interaction)\s+design(?:er)?\b|\bdesigner\b|设计师/ },
+        { tag: 'DATA', re: /\bdata\b|\banalytics\b|\bbusiness\s+intelligence\b|\bbi\b|数据/ },
+        { tag: 'AI', re: /\bai\b|\bartificial\s+intelligence\b|\bmachine\s+learning\b|\bml\b|\bdeep\s+learning\b|\bnlp\b|人工智能|算法/ },
+        { tag: 'SEC', re: /\b(?:info(?:rmation)?\s+)?security\b|\bappsec\b|\binfosec\b|\bsecops\b|安全/ },
+        { tag: 'DEVOPS', re: /\bdev\s*ops\b|\bsre\b|\bsite\s+reliability\b|\bplatform\s+engineer/ },
+        { tag: 'OPS', re: /\boperations?\b|\bsysadmin\b|运维/ },
+        { tag: 'HR', re: /\bhuman\s+resources\b|\bhr\b|\bpeople\s+(?:ops|partner|business)\b|\brecruit(?:er|ing|ment)\b|\btalent\s+acquisition\b|\blearning\s*(?:&|and)\s*development\b|人力资源|招聘/ },
+        { tag: 'FIN', re: /\bfinanc(?:e|ial)\b|\baccount(?:ant|ing)\b|\bcontroller\b|\bpayroll\b|\btreasury\b|财务/ },
+        { tag: 'CS', re: /\bcustomer\s+(?:success|care|support|service|experience)\b|\bsupport\s+(?:engineer|agent|specialist)\b|\btechnical\s+support\b|\bhelpdesk\b|客服|客户成功/ },
+        { tag: 'SALES', re: /\bsales\b|\baccount\s+executive\b|\bbusiness\s+development\b|\bbdr\b|\bsdr\b|\bsolutions?\s+(?:consultant|engineer)\b|销售/ },
+        { tag: 'MKT', re: /\bmarket(?:ing|er)\b|\bdemand\s+gen|\bbrand\b|\bgrowth\b|营销|市场/ },
+        { tag: 'LEGAL', re: /\blegal\b|\bcounsel\b|\battorney\b|\bcompliance\b|法务/ },
         { tag: 'IT', re: /\binformation\s+technology\b|\bit\s+(?:support|engineer|specialist|manager|admin)\b|^it$/ },
-        { tag: 'BA', re: /\bbusiness\s+analyst\b|\b\bba\b/ },
-        { tag: 'TW', re: /\btechnical\s+writer\b|\bcontent\s+designer\b|\bdocumentarian\b/ },
+        { tag: 'BA', re: /\bbusiness\s+analyst\b|\bba\b/ },
+        { tag: 'TW', re: /\btechnical\s+writer\b|\bcontent\s+designer\b|\bdocumentarian\b|\bdocumentation\b/ },
         { tag: 'SM', re: /\bscrum\s+master\b|\bagile\s+coach\b/ },
-        { tag: 'ARCH', re: /\barchitect\b/ },
+        { tag: 'ARCH', re: /\barchitect\b|架构/ },
     ];
 
+    // TL before MGR so "技术主管" reads as team lead, bare "主管" as manager.
     const RANK_OTHER = [
-        { tag: 'DIR', re: /\bdirector\b|\bdir\b|总监/ },
-        { tag: 'MGR', re: /\bmanager\b|\bmgr\b|经理/ },
-        { tag: 'TL', re: /\bteam\s*leads?\b|\btech(?:nical)?\s+leads?\b|\bengineering\s+leads?\b|\b\btl\b|组长|团队负责人|技术主管/ },
-        { tag: 'INT', re: /\bintern\b|\btrainee\b|实习生/ },
+        { tag: 'DIR', re: /\bdirector\b|\bdir\.?\b|\bhead\s+of\b|总监/ },
+        { tag: 'TL', re: /\b(?:team|tech(?:nical)?|eng(?:ineering)?|dev(?:elopment)?|squad|feature|delivery)\s*leads?\b|^leads?\b|\bleads?\s*$|\btl\b|组长|团队负责人|技术主管|负责人/ },
+        { tag: 'MGR', re: /\bmanager\b|\bmgr\.?\b|\bsupervisor\b|经理|主管/ },
+        { tag: 'INT', re: /\bintern\b|\btrainee\b|实习/ },
     ];
 
     const FUNC_GENERIC = [
-        { tag: 'ENG', re: /\bengineer\b|\bdeveloper\b|\bprogrammer\b|\bsoftware\b|工程师|开发/ },
+        { tag: 'ENG', re: /\bengineer(?:ing)?\b|\bdevelop(?:er|ment)\b|\bprogrammer\b|\bswe\b|\bsde\b|\bsoftware\b|\br&d\b|工程师|开发|研发/ },
     ];
 
     function themeOf(tag) {
@@ -308,6 +317,14 @@
         return '';
     }
 
+    const unmatchedSeen = new Set();
+    function noteUnmatched(name, title, department) {
+        const key = (title + '|' + department).toLowerCase();
+        if (unmatchedSeen.has(key)) return;
+        unmatchedSeen.add(key);
+        LOG('no role rule matched:', name || '?', '·', title || '(no title)', '·', department || '(no dept)');
+    }
+
     function putRecord(id, partial, dirty) {
         if (!id) return null;
         const prev = memory.get(id) || {};
@@ -317,6 +334,7 @@
         const department = partial.department || prev.department || '';
         const ov = overrideTagFor(id, name, email);
         const tag = ov || classify(title, department, name, email) || prev.tag || '';
+        if (!tag && (title || department)) noteUnmatched(name, title, department);
         const rec = {
             id: id,
             name: name,
@@ -604,8 +622,9 @@
                 const line = text[k];
                 if (/^mailto:|^profile$|^ringcentral$/i.test(line)) continue;
                 if (line.indexOf('@') !== -1) continue;
-                if (/^\+?\d[\d\s().-]{6,}$/.test(line)) continue;
-                if (/ext\.?\s*\d+/i.test(line)) continue;
+                if (/^\+?[\d(][\d\s().|-]{6,}$/.test(line)) continue;
+                if (/(?:ext|分机|内线|內線)\.?\s*\d+/i.test(line)) continue;
+                if (/\d{3}[\s().-]*\d{3}[\s.-]*\d{4}/.test(line)) continue;
                 if (!name) { name = line; continue; }
                 if (!title) { title = line; continue; }
                 if (!department && line.length < 80) { department = line; break; }
@@ -914,6 +933,7 @@
             scheduleScan();
         },
         dump: function (id) { return id ? memory.get(String(id)) : Array.from(memory.values()).slice(0, 30); },
+        unmatched: function () { return Array.from(unmatchedSeen); },
     };
 
     boot();
