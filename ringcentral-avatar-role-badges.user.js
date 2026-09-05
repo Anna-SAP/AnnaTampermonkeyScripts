@@ -2,7 +2,7 @@
 // @name         RingCentral Avatar Role Badges
 // @name:zh-CN   RingCentral 头像角色标签
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.1.0
+// @version      1.1.1
 // @description  Overlay short role tags (QA, L10N, PM, TL, GVP, EVP, …) on people avatars in RingCentral Messages. Titles come from Glip IndexedDB, directory API responses, and profile popovers.
 // @description:zh-CN  在 RingCentral 网页聊天（/messages）里，根据职位/部门给用户头像叠上短角色标签（QA、L10N、PM、TL、GVP、EVP 等）。数据来自 Glip IndexedDB、目录接口和资料浮层。
 // @author       Anna-SAP
@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.1.0';
+    const VERSION = '1.1.1';
     const STYLE_ID = '__TM_RC_ROLE_STYLE__';
     const HOST_CLASS = 'tm-rc-role-host';
     const HOST_SM_CLASS = 'tm-rc-role-sm';
@@ -156,12 +156,37 @@
         return '';
     }
 
+    // Only name/email decide bot-ness. Titles such as "QA Automation Engineer"
+    // belong to humans and must not be filtered out.
     function isBot(name, email, title) {
-        const h = (name + ' ' + email + ' ' + title).toLowerCase();
-        if (/\bbot\b/.test(h)) return true;
-        if (/bot@/.test(h)) return true;
-        if (/\b(?:automation|webhook|notifier)\b/.test(h)) return true;
+        const ident = (name + ' ' + email).toLowerCase();
+        if (/\bbot\b/.test(ident)) return true;
+        if (/bot@/.test(ident)) return true;
+        if (/\b(?:webhook|notifier)\b/.test(ident)) return true;
+        if (/^\s*bot\s*$/i.test(String(title || ''))) return true;
         return false;
+    }
+
+    // Custom status lines in the profile popover ("🦜", "🏖️ OOO till Monday")
+    // sit between the name and the job title. Anything that starts with an
+    // emoji/pictograph, or has no letters at all, is not a title.
+    const EMOJI_START_RE = /^[\s‍️]*(?:\p{Extended_Pictographic}|\p{Emoji_Presentation}|[\u{1F1E6}-\u{1F1FF}])/u;
+    const HAS_LETTER_RE = /\p{L}/u;
+    const PRESENCE_RE = /^(?:available|busy|do not disturb|dnd|away|offline|invisible|in a meeting|on a call|在线|忙碌|请勿打扰|离开|离线|隐身|会议中|通话中)$/i;
+
+    function isStatusLine(line) {
+        const s = String(line || '').trim();
+        if (!s) return true;
+        if (!HAS_LETTER_RE.test(s)) return true;
+        if (EMOJI_START_RE.test(s)) return true;
+        if (PRESENCE_RE.test(s)) return true;
+        return false;
+    }
+
+    function cleanTitle(title) {
+        const s = String(title || '').trim();
+        if (!s) return '';
+        return isStatusLine(s) ? '' : s;
     }
 
     // Examples:
@@ -330,8 +355,8 @@
         const prev = memory.get(id) || {};
         const name = partial.name || prev.name || '';
         const email = partial.email || prev.email || '';
-        const title = partial.title || prev.title || '';
-        const department = partial.department || prev.department || '';
+        const title = cleanTitle(partial.title) || cleanTitle(prev.title) || '';
+        const department = cleanTitle(partial.department) || cleanTitle(prev.department) || '';
         const ov = overrideTagFor(id, name, email);
         const tag = ov || classify(title, department, name, email) || prev.tag || '';
         if (!tag && (title || department)) noteUnmatched(name, title, department);
@@ -368,9 +393,9 @@
         const last = pickField(obj, ['last_name', 'lastName']);
         const combined = (first + ' ' + last).trim();
         const name = pickField(obj, NAME_PATHS) || combined;
-        let title = pickField(obj, TITLE_PATHS);
+        let title = cleanTitle(pickField(obj, TITLE_PATHS));
         if (title && /^(mr|mrs|ms|dr|miss)\.?$/i.test(title)) title = '';
-        const department = pickField(obj, DEPT_PATHS);
+        const department = cleanTitle(pickField(obj, DEPT_PATHS));
         const email = pickField(obj, EMAIL_PATHS);
         if (!title && !department && !overrideTagFor(id, name, email)) {
             if (!memory.has(id)) putRecord(id, { name: name, email: email }, true);
@@ -620,12 +645,20 @@
             let department = '';
             for (let k = 0; k < text.length; k++) {
                 const line = text[k];
-                if (/^mailto:|^profile$|^ringcentral$/i.test(line)) continue;
+                if (/^mailto:|^profile$|^个人资料$|^ringcentral$/i.test(line)) continue;
                 if (line.indexOf('@') !== -1) continue;
                 if (/^\+?[\d(][\d\s().|-]{6,}$/.test(line)) continue;
                 if (/(?:ext|分机|内线|內線)\.?\s*\d+/i.test(line)) continue;
                 if (/\d{3}[\s().-]*\d{3}[\s.-]*\d{4}/.test(line)) continue;
-                if (!name) { name = line; continue; }
+                if (!name) {
+                    // Name may carry a trailing status emoji ("Sergey Bacho 🦜").
+                    const n = line.replace(/[\s‍️]*(?:\p{Extended_Pictographic}|\p{Emoji_Presentation})+[\s‍️]*$/u, '').trim();
+                    if (!n) continue;
+                    name = n;
+                    continue;
+                }
+                // Custom status / presence lines sit between name and title.
+                if (isStatusLine(line)) continue;
                 if (!title) { title = line; continue; }
                 if (!department && line.length < 80) { department = line; break; }
             }
