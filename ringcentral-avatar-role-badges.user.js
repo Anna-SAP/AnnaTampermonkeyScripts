@@ -2,7 +2,7 @@
 // @name         RingCentral Avatar Role Badges
 // @name:zh-CN   RingCentral 头像角色标签
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.1.1
+// @version      1.2.0
 // @description  Overlay short role tags (QA, L10N, PM, TL, GVP, EVP, …) on people avatars in RingCentral Messages. Titles come from Glip IndexedDB, directory API responses, and profile popovers.
 // @description:zh-CN  在 RingCentral 网页聊天（/messages）里，根据职位/部门给用户头像叠上短角色标签（QA、L10N、PM、TL、GVP、EVP 等）。数据来自 Glip IndexedDB、目录接口和资料浮层。
 // @author       Anna-SAP
@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.1.1';
+    const VERSION = '1.2.0';
     const STYLE_ID = '__TM_RC_ROLE_STYLE__';
     const HOST_CLASS = 'tm-rc-role-host';
     const HOST_SM_CLASS = 'tm-rc-role-sm';
@@ -219,6 +219,23 @@
         return '';
     }
 
+    // No rule matched but the person has a real title ("India Features Team",
+    // "RC Innovation"): fall back to initials so the badge still tells you
+    // something, and the tooltip carries the full title.
+    const FALLBACK_STOP = /^(?:of|and|the|for|in|at|to|a|an|&|sr|jr|senior|junior|ii|iii|iv)$/i;
+    function fallbackTag(title, department) {
+        const src = primaryTitle(title) || primaryTitle(department);
+        if (!src) return '';
+        const words = src
+            .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
+            .split(/[\s-]+/)
+            .filter(function (w) { return w && !FALLBACK_STOP.test(w); });
+        if (!words.length) return '';
+        if (/\p{Script=Han}/u.test(words[0])) return words[0].slice(0, 2);
+        if (words.length === 1) return words[0].slice(0, 4).toUpperCase();
+        return words.slice(0, 4).map(function (w) { return w[0]; }).join('').toUpperCase();
+    }
+
     function pickField(obj, paths) {
         if (!obj || typeof obj !== 'object') return '';
         for (let i = 0; i < paths.length; i++) {
@@ -358,8 +375,12 @@
         const title = cleanTitle(partial.title) || cleanTitle(prev.title) || '';
         const department = cleanTitle(partial.department) || cleanTitle(prev.department) || '';
         const ov = overrideTagFor(id, name, email);
-        const tag = ov || classify(title, department, name, email) || prev.tag || '';
-        if (!tag && (title || department)) noteUnmatched(name, title, department);
+        let tag = ov || classify(title, department, name, email) || '';
+        if (!tag && (title || department) && !isBot(name, email, title)) {
+            noteUnmatched(name, title, department);
+            tag = fallbackTag(title, department);
+        }
+        if (!tag) tag = prev.tag || '';
         const rec = {
             id: id,
             name: name,
@@ -628,44 +649,112 @@
         return anchor.parentElement;
     }
 
+    // Candidate popover containers. Filtered hard below so a message card or
+    // a reply dialog never gets parsed as a profile.
+    const POPOVER_SEL = [
+        '[role="dialog"]', '[role="tooltip"]', '[role="presentation"]',
+        '[class*="opover"]', '[class*="opper"]', '[class*="rofile"]',
+    ].join(',');
+    const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/;
+    const PHONE_RE = /(?:\+?\d[\d\s().-]{7,}\d)|(?:ext|分机|内线|內線)\.?\s*\d+/i;
+    const PROFILE_LABEL_RE = /(?:^|\n)\s*(?:个人资料|個人資料|profile|프로필|プロフィール)\s*(?:\n|$)/i;
+    const COMPANY_LINE_RE = /^(?:ringcentral|rc innovation|ringcentral innovation(?: india)?)$/i;
+
+    function popoverText(el) {
+        return el.innerText || '';
+    }
+
+    function looksLikeProfilePopover(el) {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.closest(CARD_SEL)) return false;
+        if (el.querySelectorAll(AVATAR_SEL).length !== 1) return false;
+        const t = popoverText(el);
+        if (t.length < 15 || t.length > 1500) return false;
+        if (!PROFILE_LABEL_RE.test(t)) return false;
+        return EMAIL_RE.test(t) || PHONE_RE.test(t);
+    }
+
+    function parseProfileLines(text) {
+        const lines = text.split(/\n+/).map(function (s) { return s.trim(); }).filter(Boolean);
+        let name = '';
+        let title = '';
+        let department = '';
+        let email = '';
+        for (let k = 0; k < lines.length; k++) {
+            const line = lines[k];
+            if (/^mailto:|^profile$|^个人资料$|^個人資料$/i.test(line)) continue;
+            if (COMPANY_LINE_RE.test(line)) continue;
+            if (line.indexOf('@') !== -1) {
+                const m = line.match(EMAIL_RE);
+                if (m && !email) email = m[0];
+                continue;
+            }
+            if (/^\+?[\d(][\d\s().|-]{6,}$/.test(line)) continue;
+            if (/(?:ext|分机|内线|內線)\.?\s*\d+/i.test(line)) continue;
+            if (/\d{3}[\s().-]*\d{3}[\s.-]*\d{4}/.test(line)) continue;
+            if (!name) {
+                // Name may carry a trailing status emoji ("Sergey Bacho 🦜").
+                const n = line.replace(/[\s‍️]*(?:\p{Extended_Pictographic}|\p{Emoji_Presentation})+[\s‍️]*$/u, '').trim();
+                if (!n) continue;
+                name = n;
+                continue;
+            }
+            // Custom status / presence lines sit between name and title.
+            if (isStatusLine(line)) continue;
+            if (!title) { title = line; continue; }
+            if (!department && line.length < 80) { department = line; break; }
+        }
+        return { name: name, title: title, department: department, email: email };
+    }
+
+    function ingestPopover(root, mailtoEmail) {
+        const parsed = parseProfileLines(popoverText(root));
+        const email = (mailtoEmail || parsed.email || '').toLowerCase();
+        const avatar = root.querySelector(AVATAR_SEL);
+        const uid = avatar ? (avatar.getAttribute('data-uid') || '') : '';
+        const um = uid.match(/GLIP_PERSON\.(\d+)/);
+        let name = parsed.name;
+        if (avatar && !name) name = parseNameFromAria(avatar.getAttribute('aria-label') || '');
+        if (!name || !parsed.title) return;
+        let id = um ? um[1] : '';
+        if (!id) {
+            const known = (email && byEmail.get(email)) || byName.get(name.toLowerCase());
+            id = known && /^\d+$/.test(String(known.id)) ? known.id : ('email:' + (email || name.toLowerCase()));
+        }
+        putRecord(id, { name: name, email: email, title: parsed.title, department: parsed.department }, true);
+    }
+
     function scrapeMiniProfiles() {
+        const seen = new Set();
+        // 1) mailto anchors — cheap and precise when present.
         const mails = document.querySelectorAll('a[href^="mailto:"]');
-        if (!mails.length) return;
         for (let i = 0; i < mails.length; i++) {
             const a = mails[i];
             const href = a.getAttribute('href') || '';
             const email = href.replace(/^mailto:/i, '').split('?')[0].trim();
             if (!email || email.indexOf('@') === -1) continue;
             const root = profileRoot(a);
-            if (!root) continue;
-            const text = (root.innerText || '').split(/\n+/).map(function (s) { return s.trim(); }).filter(Boolean);
-            if (text.length < 2) continue;
-            let name = '';
-            let title = '';
-            let department = '';
-            for (let k = 0; k < text.length; k++) {
-                const line = text[k];
-                if (/^mailto:|^profile$|^个人资料$|^ringcentral$/i.test(line)) continue;
-                if (line.indexOf('@') !== -1) continue;
-                if (/^\+?[\d(][\d\s().|-]{6,}$/.test(line)) continue;
-                if (/(?:ext|分机|内线|內線)\.?\s*\d+/i.test(line)) continue;
-                if (/\d{3}[\s().-]*\d{3}[\s.-]*\d{4}/.test(line)) continue;
-                if (!name) {
-                    // Name may carry a trailing status emoji ("Sergey Bacho 🦜").
-                    const n = line.replace(/[\s‍️]*(?:\p{Extended_Pictographic}|\p{Emoji_Presentation})+[\s‍️]*$/u, '').trim();
-                    if (!n) continue;
-                    name = n;
-                    continue;
-                }
-                // Custom status / presence lines sit between name and title.
-                if (isStatusLine(line)) continue;
-                if (!title) { title = line; continue; }
-                if (!department && line.length < 80) { department = line; break; }
+            if (!root || seen.has(root)) continue;
+            seen.add(root);
+            ingestPopover(root, email);
+        }
+        // 2) structural detection — the mini profile carries its own avatar
+        //    (GLIP_PERSON uid), a 个人资料/Profile action, and email/phone text.
+        //    Needed when the email is plain text rather than a mailto link.
+        const cands = document.querySelectorAll(POPOVER_SEL);
+        const hits = [];
+        for (let i = 0; i < cands.length; i++) {
+            if (looksLikeProfilePopover(cands[i])) hits.push(cands[i]);
+        }
+        for (let i = 0; i < hits.length; i++) {
+            const el = hits[i];
+            let inner = false;
+            for (let j = 0; j < hits.length; j++) {
+                if (i !== j && el !== hits[j] && el.contains(hits[j])) { inner = true; break; }
             }
-            if (!name || !title) continue;
-            const known = byEmail.get(email.toLowerCase()) || byName.get(name.toLowerCase());
-            const id = known && /^\d+$/.test(String(known.id)) ? known.id : ('email:' + email.toLowerCase());
-            putRecord(id, { name: name, email: email, title: title, department: department }, true);
+            if (inner || seen.has(el)) continue; // prefer the innermost container
+            seen.add(el);
+            ingestPopover(el, '');
         }
     }
 
