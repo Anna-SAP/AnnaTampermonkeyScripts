@@ -2,7 +2,7 @@
 // @name         RingCentral Avatar Role Badges
 // @name:zh-CN   RingCentral 头像角色标签
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.2.0
+// @version      1.2.1
 // @description  Overlay short role tags (QA, L10N, PM, TL, GVP, EVP, …) on people avatars in RingCentral Messages. Titles come from Glip IndexedDB, directory API responses, and profile popovers.
 // @description:zh-CN  在 RingCentral 网页聊天（/messages）里，根据职位/部门给用户头像叠上短角色标签（QA、L10N、PM、TL、GVP、EVP 等）。数据来自 Glip IndexedDB、目录接口和资料浮层。
 // @author       Anna-SAP
@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.2.0';
+    const VERSION = '1.2.1';
     const STYLE_ID = '__TM_RC_ROLE_STYLE__';
     const HOST_CLASS = 'tm-rc-role-host';
     const HOST_SM_CLASS = 'tm-rc-role-sm';
@@ -174,6 +174,24 @@
     const HAS_LETTER_RE = /\p{L}/u;
     const PRESENCE_RE = /^(?:available|busy|do not disturb|dnd|away|offline|invisible|in a meeting|on a call|在线|忙碌|请勿打扰|离开|离线|隐身|会议中|通话中)$/i;
 
+    // RingCentral renders status emoji as <img>, so innerText of "🇮🇳 UTC + 5:30"
+    // is just "UTC + 5:30". Text-level status signals: time zones, clock
+    // times, WFH/OOO/PTO, leave/vacation, "back on"/"until", locations.
+    const STATUS_TEXT_RE = new RegExp([
+        '\\b(?:utc|gmt|ist|pst|pdt|est|edt|cet|cest|msk|hkt|sgt|jst)\\b',
+        '(?:^|[\\s(])[+-]\\s?\\d{1,2}(?::\\d{2})?(?:\\s|$|\\))',
+        '\\b\\d{1,2}:\\d{2}\\s*(?:am|pm)?\\b',
+        '\\bwfh|\\booo\\b|\\bpto\\b|\\boof\\b|\\bafk\\b|\\bbrb\\b',
+        '\\b(?:on\\s+leave|on\\s+vacation|vacation|holiday|sick|out\\s+of\\s+(?:the\\s+)?office|back\\s+on|until|till|working\\s+from|work\\s+from|in\\s+office|at\\s+office)\\b',
+        '休假|请假|年假|病假|出差|居家|在家办公|时区|外出|下班|午休|不在|会议中|通话中',
+    ].join('|'), 'i');
+
+    // Words that make a line read as a job title / team name rather than a status.
+    const TITLE_HINT_RE = new RegExp([
+        '\\b(?:team|engineer(?:ing)?|developer|development|manager|management|lead|intern|specialist|analyst|director|head|officer|consultant|architect|designer|design|scientist|coordinator|associate|assistant|executive|president|advocate|representative|partner|owner|admin(?:istrator)?|support|success|staff|principal|senior|junior|sr|jr|qa|pm|ux|ui|devops|sre|ops|hr|finance|sales|marketing|legal|product|platform|backend|frontend|mobile|cloud|infra(?:structure)?|security|data|research|innovation|features?|services?|solutions?|program|project|delivery|quality|automation|localization|l10n|i18n)\\b',
+        '工程师|经理|总监|主管|专员|助理|实习|团队|负责人|架构|设计|测试|产品|运营|研发|开发|本地化|翻译',
+    ].join('|'), 'i');
+
     function isStatusLine(line) {
         const s = String(line || '').trim();
         if (!s) return true;
@@ -183,10 +201,28 @@
         return false;
     }
 
+    // Text-only status detection for a line whose emoji was an <img>.
+    // A line that also carries a role/title word is kept as a title
+    // ("Support Engineer (UTC+8)" stays a title; "UTC + 5:30" does not).
+    function looksLikeStatusText(line) {
+        const s = String(line || '').trim();
+        if (!s) return true;
+        if (isStatusLine(s)) return true;
+        if (!STATUS_TEXT_RE.test(s)) return false;
+        return !TITLE_HINT_RE.test(s);
+    }
+
+    function looksLikeTitleText(line) {
+        const s = String(line || '').trim();
+        if (!s || looksLikeStatusText(s)) return false;
+        if (TITLE_HINT_RE.test(s)) return true;
+        return !!classify(s, '', '', '');
+    }
+
     function cleanTitle(title) {
         const s = String(title || '').trim();
         if (!s) return '';
-        return isStatusLine(s) ? '' : s;
+        return looksLikeStatusText(s) ? '' : s;
     }
 
     // Examples:
@@ -222,15 +258,20 @@
     // No rule matched but the person has a real title ("India Features Team",
     // "RC Innovation"): fall back to initials so the badge still tells you
     // something, and the tooltip carries the full title.
+    // "India Features Team" → drop region + generic words → "Features" → FEAT.
+    // Several distinctive words left → initials ("Unified App Platform" → UAP).
     const FALLBACK_STOP = /^(?:of|and|the|for|in|at|to|a|an|&|sr|jr|senior|junior|ii|iii|iv)$/i;
+    const FALLBACK_GENERIC = /^(?:team|teams|group|dept|department|division|unit|org|organization|office|staff|member|india|china|us|usa|uk|eu|emea|apac|latam|amer|global|international|regional|rc|ringcentral)$/i;
     function fallbackTag(title, department) {
         const src = primaryTitle(title) || primaryTitle(department);
         if (!src) return '';
-        const words = src
+        const all = src
             .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
             .split(/[\s-]+/)
             .filter(function (w) { return w && !FALLBACK_STOP.test(w); });
-        if (!words.length) return '';
+        if (!all.length) return '';
+        let words = all.filter(function (w) { return !FALLBACK_GENERIC.test(w); });
+        if (!words.length) words = all;
         if (/\p{Script=Han}/u.test(words[0])) return words[0].slice(0, 2);
         if (words.length === 1) return words[0].slice(0, 4).toUpperCase();
         return words.slice(0, 4).map(function (w) { return w[0]; }).join('').toUpperCase();
@@ -674,12 +715,41 @@
         return EMAIL_RE.test(t) || PHONE_RE.test(t);
     }
 
-    function parseProfileLines(text) {
+    // Lines that visually carry an emoji <img>/<span> (custom status). The
+    // emoji itself is not in innerText, so find it in the DOM and remember
+    // the text of the line it sits on. Avatar and presence images are skipped.
+    const EMOJI_NODE_SEL = 'img, [role="img"], [class*="emoji" i], [class*="Emoji"], [data-emoji], [aria-label*="emoji" i]';
+    function emojiLineTexts(root) {
+        const out = new Set();
+        let nodes;
+        try { nodes = root.querySelectorAll(EMOJI_NODE_SEL); } catch (e) { return out; }
+        for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            if (n.closest && n.closest(AVATAR_SEL)) continue;
+            if (n.closest && n.closest('[data-test-automation-id="presence"]')) continue;
+            let el = n.parentElement;
+            for (let d = 0; d < 4 && el && el !== root; d++) {
+                const t = (el.innerText || '').trim();
+                if (t) {
+                    const first = t.split(/\n+/)[0].trim();
+                    if (first && first.length < 80) out.add(first);
+                    break;
+                }
+                el = el.parentElement;
+            }
+        }
+        return out;
+    }
+
+    // name → [status lines…] → title → department → company → email → phone.
+    // Status lines are dropped by DOM evidence (emoji image on the line) or
+    // text evidence (time zone, WFH, leave…). Among what remains, the first
+    // line that reads like a title wins; otherwise the first plain line.
+    function parseProfileLines(text, emojiLines) {
         const lines = text.split(/\n+/).map(function (s) { return s.trim(); }).filter(Boolean);
         let name = '';
-        let title = '';
-        let department = '';
         let email = '';
+        const cands = [];
         for (let k = 0; k < lines.length; k++) {
             const line = lines[k];
             if (/^mailto:|^profile$|^个人资料$|^個人資料$/i.test(line)) continue;
@@ -699,16 +769,24 @@
                 name = n;
                 continue;
             }
-            // Custom status / presence lines sit between name and title.
-            if (isStatusLine(line)) continue;
-            if (!title) { title = line; continue; }
-            if (!department && line.length < 80) { department = line; break; }
+            if (emojiLines && emojiLines.has(line)) continue;
+            if (looksLikeStatusText(line)) continue;
+            if (line.length >= 80) continue;
+            cands.push(line);
+            if (cands.length >= 3) break;
         }
+        let ti = -1;
+        for (let i = 0; i < cands.length; i++) {
+            if (looksLikeTitleText(cands[i])) { ti = i; break; }
+        }
+        if (ti < 0 && cands.length) ti = 0;
+        const title = ti >= 0 ? cands[ti] : '';
+        const department = ti >= 0 && cands[ti + 1] ? cands[ti + 1] : '';
         return { name: name, title: title, department: department, email: email };
     }
 
     function ingestPopover(root, mailtoEmail) {
-        const parsed = parseProfileLines(popoverText(root));
+        const parsed = parseProfileLines(popoverText(root), emojiLineTexts(root));
         const email = (mailtoEmail || parsed.email || '').toLowerCase();
         const avatar = root.querySelector(AVATAR_SEL);
         const uid = avatar ? (avatar.getAttribute('data-uid') || '') : '';
@@ -1056,6 +1134,8 @@
         },
         dump: function (id) { return id ? memory.get(String(id)) : Array.from(memory.values()).slice(0, 30); },
         unmatched: function () { return Array.from(unmatchedSeen); },
+        scrape: function () { scrapeMiniProfiles(); scheduleScan(); },
+        parseProfile: parseProfileLines,
     };
 
     boot();
