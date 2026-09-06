@@ -2,9 +2,9 @@
 // @name         RingCentral Highlight [FIX]
 // @name:zh-CN   RingCentral 高亮 [FIX] 消息
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.1.0
-// @description  Highlight the inner RingCentral Adaptive Card when it contains [FIX] or [BATCH_FIX], and mark word/character diffs between Before and After translation text.
-// @description:zh-CN  实时查找包含关键字 [FIX] 或 [BATCH_FIX] 的 RingCentral 消息，仅将内层自适应卡片背景标为黄色；并提取 Before/After 文本，在卡片内用红色标出词级或字符级差异。
+// @version      1.2.0
+// @description  Highlight the inner RingCentral Adaptive Card when it contains [FIX] or [BATCH_FIX], and mark word/character diffs between Before and After translation text (deletions in red, insertions in green).
+// @description:zh-CN  实时查找包含关键字 [FIX] 或 [BATCH_FIX] 的 RingCentral 消息，仅将内层自适应卡片标为柔和的奶油色；并提取 Before/After 文本，在卡片内以浅红底/深红字标出删除、浅绿底/深绿字标出新增的词级或字符级差异。
 // @author       Anna-SAP
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -22,6 +22,8 @@
     const STYLE_ID = '__TM_RC_FIX_HL_STYLE__';
     const HL_CLASS = 'tm-rc-fix-hl';
     const DIFF_CLASS = 'tm-rc-diff-hl';
+    const DIFF_DEL_CLASS = 'tm-rc-diff-del';
+    const DIFF_INS_CLASS = 'tm-rc-diff-ins';
     const DIFF_WS_CLASS = 'tm-rc-diff-ws';
     const DIFF_ATTR = 'data-tm-rc-diff';
     const MESSAGES_PATH_RE = /\/messages(\/|$)/;
@@ -30,6 +32,17 @@
     const LABEL_AFTER_RE = /^after:?$/i;
     const TOKEN_RE = /\{\{[^{}]*\}\}|\{[^{}]*\}|\$\{[^}]+\}|%[0-9$]*[sdifSxX]|[\p{L}\p{M}\p{N}]+(?:['’][\p{L}\p{M}\p{N}]+)*|\s+|[^\s\p{L}\p{N}]+/gu;
     const BULLET_RE = /^(\s*[•●○◦‣∙·]\s*)/;
+
+    // Soft palette: cream card, warm borders, red = deleted, green = inserted.
+    const COLORS = {
+        cardBg: '#fdf8e7',
+        cardBorder: '#e6d9a8',
+        cardInnerBorder: '#ede3c2',
+        delFg: '#a3262b',
+        delBg: '#fde2e4',
+        insFg: '#166534',
+        insBg: '#d8f3dc',
+    };
 
     // Outer message rows — used only to find messages, never painted yellow.
     const CARD_SELECTOR = [
@@ -54,32 +67,54 @@
             style.id = STYLE_ID;
             (document.head || document.documentElement).appendChild(style);
         }
-        // Paint only the compact inner card. Keep action buttons readable.
-        // Diff marks: red text + coral chip so they stay visible on the yellow card.
+        // Paint only the compact inner card: cream background, warm border,
+        // rounded corners. Keep action buttons readable.
+        // Diff marks: Before (deleted) = light red chip + dark red text,
+        // After (inserted) = light green chip + dark green text.
         style.textContent = [
-            '.' + HL_CLASS + ',',
-            '.' + HL_CLASS + ' .ac-container {',
-            '  background-color: #fff176 !important;',
+            '.' + HL_CLASS + ' {',
+            '  background-color: ' + COLORS.cardBg + ' !important;',
             '  background-image: none !important;',
+            '  border: 1px solid ' + COLORS.cardBorder + ' !important;',
+            '  border-radius: 10px !important;',
+            '  box-shadow: none !important;',
+            '}',
+            '.' + HL_CLASS + ' .ac-adaptiveCard,',
+            '.' + HL_CLASS + ' .ac-container {',
+            '  background-color: ' + COLORS.cardBg + ' !important;',
+            '  background-image: none !important;',
+            '}',
+            // Only recolours borders that already exist; adds none.
+            '.' + HL_CLASS + ' .ac-adaptiveCard,',
+            '.' + HL_CLASS + ' .ac-container,',
+            '.' + HL_CLASS + ' .ac-horizontal-separator,',
+            '.' + HL_CLASS + ' .ac-separator {',
+            '  border-color: ' + COLORS.cardInnerBorder + ' !important;',
             '}',
             '.' + HL_CLASS + ' .ac-pushButton,',
             '.' + HL_CLASS + ' button {',
             '  background-color: #fff !important;',
             '}',
             '.' + DIFF_CLASS + ' {',
-            '  color: #b71c1c !important;',
-            '  background-color: #ff8a80 !important;',
-            '  font-weight: 700 !important;',
-            '  border-radius: 2px;',
-            '  padding: 0 1px;',
+            '  border-radius: 3px;',
+            '  padding: 0 2px;',
             '  box-decoration-break: clone;',
             '  -webkit-box-decoration-break: clone;',
             '}',
+            '.' + DIFF_DEL_CLASS + ' {',
+            '  color: ' + COLORS.delFg + ' !important;',
+            '  background-color: ' + COLORS.delBg + ' !important;',
+            '}',
+            '.' + DIFF_INS_CLASS + ' {',
+            '  color: ' + COLORS.insFg + ' !important;',
+            '  background-color: ' + COLORS.insBg + ' !important;',
+            '}',
+            // Whitespace-only changes: keep the chip visible, underline in the side colour.
             '.' + DIFF_WS_CLASS + ' {',
             '  white-space: pre;',
             '  padding: 0 3px;',
             '  margin: 0 1px;',
-            '  border-bottom: 2px solid #c62828;',
+            '  border-bottom: 2px solid currentColor;',
             '}',
         ].join('\n');
     }
@@ -856,7 +891,8 @@
         return pairs;
     }
 
-    function fillEl(el, bullet, pieces, sig) {
+    function fillEl(el, bullet, pieces, sig, side) {
+        const sideClass = side === 'before' ? DIFF_DEL_CLASS : DIFF_INS_CLASS;
         while (el.firstChild) el.removeChild(el.firstChild);
         if (bullet) el.appendChild(document.createTextNode(bullet));
         for (let i = 0; i < pieces.length; i++) {
@@ -868,8 +904,8 @@
             }
             const span = document.createElement('span');
             span.className = /^\s+$/.test(p.text)
-                ? DIFF_CLASS + ' ' + DIFF_WS_CLASS
-                : DIFF_CLASS;
+                ? DIFF_CLASS + ' ' + sideClass + ' ' + DIFF_WS_CLASS
+                : DIFF_CLASS + ' ' + sideClass;
             span.textContent = p.text;
             el.appendChild(span);
         }
@@ -907,8 +943,8 @@
             return;
         }
         const diff = diffTexts(bSplit.body, aSplit.body);
-        fillEl(beforeEl, bSplit.bullet, diff.before, sig);
-        fillEl(afterEl, aSplit.bullet, diff.after, sig);
+        fillEl(beforeEl, bSplit.bullet, diff.before, sig, 'before');
+        fillEl(afterEl, aSplit.bullet, diff.after, sig, 'after');
     }
 
     function applyDiffs(card) {
