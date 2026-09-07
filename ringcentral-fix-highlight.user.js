@@ -2,7 +2,7 @@
 // @name         RingCentral Highlight [FIX]
 // @name:zh-CN   RingCentral 高亮 [FIX] 消息
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.2.0
+// @version      1.2.1
 // @description  Highlight the inner RingCentral Adaptive Card when it contains [FIX] or [BATCH_FIX], and mark word/character diffs between Before and After translation text (deletions in red, insertions in green).
 // @description:zh-CN  实时查找包含关键字 [FIX] 或 [BATCH_FIX] 的 RingCentral 消息，仅将内层自适应卡片标为柔和的奶油色；并提取 Before/After 文本，在卡片内以浅红底/深红字标出删除、浅绿底/深绿字标出新增的词级或字符级差异。
 // @author       Anna-SAP
@@ -58,7 +58,7 @@
     ].join(',');
 
     let scanScheduled = false;
-    let observerStarted = false;
+    let observer = null;
 
     function injectStyles() {
         let style = document.getElementById(STYLE_ID);
@@ -71,7 +71,7 @@
         // rounded corners. Keep action buttons readable.
         // Diff marks: Before (deleted) = light red chip + dark red text,
         // After (inserted) = light green chip + dark green text.
-        style.textContent = [
+        const cssText = [
             '.' + HL_CLASS + ' {',
             '  background-color: ' + COLORS.cardBg + ' !important;',
             '  background-image: none !important;',
@@ -117,6 +117,7 @@
             '  border-bottom: 2px solid currentColor;',
             '}',
         ].join('\n');
+        if (style.textContent !== cssText) style.textContent = cssText;
     }
 
     function isMessagesRoute() {
@@ -232,8 +233,18 @@
         const run = function () {
             scanScheduled = false;
             if (!isMessagesRoute()) return;
-            injectStyles();
-            scanRoot(document);
+            if (observer) observer.disconnect();
+            try {
+                injectStyles();
+                scanRoot(document);
+            } finally {
+                if (observer) {
+                    observer.observe(document.documentElement, {
+                        childList: true,
+                        subtree: true,
+                    });
+                }
+            }
         };
         if (typeof requestAnimationFrame === 'function') {
             requestAnimationFrame(run);
@@ -243,9 +254,8 @@
     }
 
     function startObserver() {
-        if (observerStarted || typeof MutationObserver !== 'function') return;
-        observerStarted = true;
-        const observer = new MutationObserver(function () {
+        if (observer || typeof MutationObserver !== 'function') return;
+        observer = new MutationObserver(function () {
             if (!isMessagesRoute()) return;
             scheduleScan();
         });
@@ -513,10 +523,15 @@
 
     function deepestHost(el) {
         if (!el) return null;
+        const diffSelector = '[' + DIFF_ATTR + ']';
+        if (el.matches && el.matches(diffSelector)) return el;
+        const existing = el.querySelector && el.querySelector(diffSelector);
+        if (existing) return existing;
         const target = el.textContent;
         let best = el;
         const all = el.getElementsByTagName('*');
         for (let i = 0; i < all.length; i++) {
+            if (all[i].classList && all[i].classList.contains(DIFF_CLASS)) continue;
             if (all[i].textContent === target) best = all[i];
         }
         return best;
@@ -794,6 +809,10 @@
         const usedEls = new Set();
 
         function addPair(bEl, aEl) {
+            const bHost = bEl && bEl.closest ? bEl.closest('[' + DIFF_ATTR + ']') : null;
+            const aHost = aEl && aEl.closest ? aEl.closest('[' + DIFF_ATTR + ']') : null;
+            if (bHost && card.contains(bHost)) bEl = bHost;
+            if (aHost && card.contains(aHost)) aEl = aHost;
             if (!bEl || !aEl || bEl === aEl) return;
             if (!looksLikeContent(bEl) || !looksLikeContent(aEl)) return;
             if (usedEls.has(bEl) || usedEls.has(aEl)) return;
