@@ -2,7 +2,7 @@
 // @name         GitLab Code Word Wrap Toggle
 // @name:zh-CN   GitLab 代码一键折行
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.1
+// @version      1.0.2
 // @description  Add a persistent one-click word-wrap toggle to GitLab repository file and blame views.
 // @description:zh-CN 为 GitLab 代码及追溯页面添加记忆状态的一键折行开关，免除长代码行的横向滚动。
 // @author       Anna-SAP
@@ -31,11 +31,20 @@
     const CODE_VIEW_PATH_RE = /\/-\/(?:blob|blame)\/.+/;
     const VIEWER_SELECTOR = [
         '[data-testid="blob-viewer-file-content"]',
+        '[data-testid="source-viewer"]',
         '[data-qa-selector="blob_viewer_file_content"]',
         '.blob-viewer[data-type="simple"]',
+        '.blob-viewer.blob-content',
         '.file-content.blame.code',
         '.file-content.code[data-type="simple"]',
+        '.file-content.code.js-syntax-highlight',
         '#blob-content-holder .blob-content',
+    ].join(', ');
+    const OVERFLOW_HOST_SELECTOR = [
+        '.gl-overflow-x-auto',
+        '.gl-overflow-auto',
+        '.gl-overflow-x-scroll',
+        '.gl-overflow-scroll',
     ].join(', ');
 
     let enabled = readStoredState();
@@ -98,6 +107,7 @@
             .${SHELL_CLASS},
             .${HOST_CLASS},
             .${VIEWER_CLASS} {
+                box-sizing: border-box !important;
                 min-width: 0 !important;
                 max-width: 100% !important;
             }
@@ -105,6 +115,25 @@
             .${HOST_CLASS},
             .${VIEWER_CLASS} {
                 overflow-x: hidden !important;
+            }
+
+            /* GitLab Source Viewer sizes a max-content column to the longest
+               line (gl-w-max + flex min-width:auto). pre-wrap then never
+               shrinks, and overflow-x:hidden clips locale JSON strings. */
+            .${VIEWER_CLASS} > .gl-flex,
+            .${VIEWER_CLASS} > .gl-w-max,
+            .${VIEWER_CLASS} .gl-w-max,
+            .${VIEWER_CLASS} [class*="gl-w-max"] {
+                box-sizing: border-box !important;
+                width: 100% !important;
+                max-width: 100% !important;
+                min-width: 0 !important;
+            }
+
+            .${VIEWER_CLASS} .gl-flex:not(.gl-absolute):not(.line-numbers):not(.line-links):not(.diff-line-num),
+            .${VIEWER_CLASS} .gl-w-full {
+                min-width: 0 !important;
+                max-width: 100% !important;
             }
 
             .${SHELL_CLASS} :is(.blame-table, .blame-table-wrapper) {
@@ -121,6 +150,10 @@
                 min-width: 0 !important;
                 max-width: 100% !important;
                 overflow-x: hidden !important;
+                overflow-y: visible !important;
+                white-space: pre-wrap !important;
+                overflow-wrap: anywhere !important;
+                word-break: break-word !important;
             }
 
             .${VIEWER_CLASS} pre > code {
@@ -133,6 +166,29 @@
                 white-space: pre-wrap !important;
                 overflow-wrap: anywhere !important;
                 word-break: break-word !important;
+            }
+
+            .${VIEWER_CLASS} pre > code[class*="gl-absolute"] {
+                position: absolute !important;
+                left: 0 !important;
+                right: 0 !important;
+                width: auto !important;
+                max-width: none !important;
+            }
+
+            .${VIEWER_CLASS} pre > code .line {
+                display: block !important;
+                box-sizing: border-box !important;
+                width: 100% !important;
+                max-width: 100% !important;
+                min-width: 0 !important;
+                white-space: pre-wrap !important;
+                overflow-wrap: anywhere !important;
+                word-break: break-word !important;
+            }
+
+            .${VIEWER_CLASS} pre > code .line * {
+                white-space: inherit !important;
             }
 
             .${VIEWER_CLASS}.blame > table {
@@ -280,7 +336,10 @@
     function findViewers() {
         const candidates = Array.from(document.querySelectorAll(VIEWER_SELECTOR));
         const codeViewers = candidates.filter((viewer) =>
-            viewer.matches('.file-content.code, .blob-content, .blob-viewer')
+            viewer.matches(
+                '.file-content.code, .blob-content, .blob-viewer, '
+                + '[data-testid="blob-viewer-file-content"], [data-testid="source-viewer"]',
+            )
             && viewer.querySelector('pre, table.highlight, .line-content, .line_content, td.blob-code'));
 
         return codeViewers.filter((viewer) =>
@@ -406,6 +465,8 @@
             if (viewer.parentElement && viewer.parentElement !== document.body) {
                 hostSet.add(viewer.parentElement);
             }
+            const overflowHost = viewer.closest(OVERFLOW_HOST_SELECTOR);
+            if (overflowHost && overflowHost !== viewer) hostSet.add(overflowHost);
             const shell = viewer.closest('.file-holder, #blob-content-holder');
             if (shell && shell !== viewer) shellSet.add(shell);
         });
