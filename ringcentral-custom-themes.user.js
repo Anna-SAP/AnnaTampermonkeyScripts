@@ -2,9 +2,9 @@
 // @name         RingCentral Dopamine & Macaron Themes
 // @name:zh-CN   RingCentral 多巴胺与马卡龙主题
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.1
-// @description  Add vivid Dopamine and soft Macaron palettes to RingCentral Web, with native-looking choices on Settings > Themes.
-// @description:zh-CN  为 RingCentral Web 增加鲜艳的多巴胺主题与柔和的马卡龙主题，并在“设置 > 主题”中加入原生风格的选择卡片。
+// @version      1.1.0
+// @description  Add Dopamine, Macaron, Strawberry, Lemon, Tangerine and Mint palettes to RingCentral Web, with native-looking choices on Settings > Themes.
+// @description:zh-CN  为 RingCentral Web 增加多巴胺、马卡龙、草莓、柠檬、橘子、薄荷等自定义主题，并在“设置 > 主题”中加入原生风格的选择卡片。
 // @author       Anna-SAP
 // @match        https://app.ringcentral.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ringcentral.com
@@ -18,14 +18,15 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.1';
+    const VERSION = '1.1.0';
     const STORAGE_KEY = 'tm-rc-custom-theme-v1';
     const ROOT_ATTRIBUTE = 'data-tm-rc-theme';
     const STYLE_ID = '__TM_RC_CUSTOM_THEME_STYLE__';
     const PANEL_ID = '__TM_RC_CUSTOM_THEME_PANEL__';
     const VALUE_ATTRIBUTE = 'data-tm-rc-custom-value';
     const THEME_ROUTE_RE = /\/settings\/theme(?:\/|$)/;
-    const VALID_THEMES = new Set(['dopamine', 'macaron']);
+    const CUSTOM_THEMES = ['dopamine', 'macaron', 'strawberry', 'lemon', 'tangerine', 'mint'];
+    const VALID_THEMES = new Set(CUSTOM_THEMES);
 
     const THEME_META = {
         dopamine: {
@@ -37,6 +38,26 @@
             label: 'Macaron',
             description: '低饱和 · 柔和粉彩',
             badge: 'Pastel',
+        },
+        strawberry: {
+            label: 'Strawberry',
+            description: '草莓牛奶 · 甜心粉',
+            badge: 'Sweet',
+        },
+        lemon: {
+            label: 'Lemon',
+            description: '柠檬苏打 · 元气黄',
+            badge: 'Zesty',
+        },
+        tangerine: {
+            label: 'Tangerine',
+            description: '橘子汽水 · 活力橙',
+            badge: 'Juicy',
+        },
+        mint: {
+            label: 'Mint',
+            description: '薄荷青柠 · 清新绿',
+            badge: 'Fresh',
         },
         default: {
             label: 'RingCentral',
@@ -158,6 +179,188 @@ html[${ROOT_ATTRIBUTE}="macaron"] body.spring-ui-jupiter {
     --tm-rc-warning-rgb: 166, 111, 73;
     --tm-rc-ai: #a66f49;
     --tm-rc-ai-rgb: 166, 111, 73;
+}
+
+/* Cute fruit palettes. The header layers a few soft "soda bubbles" over the
+   gradient; they sit between the search box and the action buttons. */
+html[${ROOT_ATTRIBUTE}="strawberry"],
+html[${ROOT_ATTRIBUTE}="strawberry"] body.spring-ui-jupiter {
+    --tm-rc-primary: #d6336c;
+    --tm-rc-primary-rgb: 214, 51, 108;
+    --tm-rc-primary-strong: #a61e4d;
+    --tm-rc-primary-strong-rgb: 166, 30, 77;
+    --tm-rc-accent: #ff6b9d;
+    --tm-rc-accent-rgb: 255, 107, 157;
+    --tm-rc-accent-two: #ffb3c9;
+    --tm-rc-bg: #fff6f9;
+    --tm-rc-bg-rgb: 255, 246, 249;
+    --tm-rc-surface: #ffffff;
+    --tm-rc-surface-rgb: 255, 255, 255;
+    --tm-rc-surface-soft: #ffeef4;
+    --tm-rc-sidebar: #ffe6ef;
+    --tm-rc-text: #3d1a28;
+    --tm-rc-text-rgb: 61, 26, 40;
+    --tm-rc-text-two: #5e3244;
+    --tm-rc-text-two-rgb: 94, 50, 68;
+    --tm-rc-muted: #8a6475;
+    --tm-rc-muted-rgb: 138, 100, 117;
+    --tm-rc-disabled-rgb: 204, 166, 182;
+    --tm-rc-border: #f7d3e0;
+    --tm-rc-border-rgb: 247, 211, 224;
+    --tm-rc-on-primary: #ffffff;
+    --tm-rc-on-primary-rgb: 255, 255, 255;
+    --tm-rc-header:
+        radial-gradient(circle at 58% 30%, rgba(255, 255, 255, 0.30) 0 7px, transparent 8px),
+        radial-gradient(circle at 66% 72%, rgba(255, 255, 255, 0.22) 0 11px, transparent 12px),
+        radial-gradient(circle at 79% 38%, rgba(255, 255, 255, 0.26) 0 5px, transparent 6px),
+        linear-gradient(110deg, #f0457f 0%, #ff6b9d 55%, #ff85ad 100%);
+    --tm-rc-on-header: #ffffff;
+    --tm-rc-selected: rgba(214, 51, 108, 0.12);
+    --tm-rc-hover: rgba(255, 107, 157, 0.10);
+    --tm-rc-shadow: 0 10px 30px rgba(214, 51, 108, 0.16);
+    --tm-rc-success: #1f8f5f;
+    --tm-rc-success-rgb: 31, 143, 95;
+    --tm-rc-danger: #c9283e;
+    --tm-rc-danger-rgb: 201, 40, 62;
+    --tm-rc-warning: #c75a00;
+    --tm-rc-warning-rgb: 199, 90, 0;
+    --tm-rc-ai: #d6336c;
+    --tm-rc-ai-rgb: 214, 51, 108;
+}
+
+html[${ROOT_ATTRIBUTE}="lemon"],
+html[${ROOT_ATTRIBUTE}="lemon"] body.spring-ui-jupiter {
+    --tm-rc-primary: #a66a00;
+    --tm-rc-primary-rgb: 166, 106, 0;
+    --tm-rc-primary-strong: #7a4d00;
+    --tm-rc-primary-strong-rgb: 122, 77, 0;
+    --tm-rc-accent: #ffcc29;
+    --tm-rc-accent-rgb: 255, 204, 41;
+    --tm-rc-accent-two: #7cc576;
+    --tm-rc-bg: #fffcef;
+    --tm-rc-bg-rgb: 255, 252, 239;
+    --tm-rc-surface: #ffffff;
+    --tm-rc-surface-rgb: 255, 255, 255;
+    --tm-rc-surface-soft: #fff7d6;
+    --tm-rc-sidebar: #fff3c4;
+    --tm-rc-text: #3b3214;
+    --tm-rc-text-rgb: 59, 50, 20;
+    --tm-rc-text-two: #5c4f24;
+    --tm-rc-text-two-rgb: 92, 79, 36;
+    --tm-rc-muted: #867a52;
+    --tm-rc-muted-rgb: 134, 122, 82;
+    --tm-rc-disabled-rgb: 196, 186, 148;
+    --tm-rc-border: #f3e3a6;
+    --tm-rc-border-rgb: 243, 227, 166;
+    --tm-rc-on-primary: #ffffff;
+    --tm-rc-on-primary-rgb: 255, 255, 255;
+    --tm-rc-header:
+        radial-gradient(circle at 58% 30%, rgba(255, 255, 255, 0.45) 0 7px, transparent 8px),
+        radial-gradient(circle at 66% 72%, rgba(255, 255, 255, 0.34) 0 11px, transparent 12px),
+        radial-gradient(circle at 79% 38%, rgba(255, 255, 255, 0.40) 0 5px, transparent 6px),
+        linear-gradient(110deg, #ffcc29 0%, #ffd84f 55%, #ffe37a 100%);
+    --tm-rc-on-header: #3f3000;
+    --tm-rc-selected: rgba(166, 106, 0, 0.12);
+    --tm-rc-hover: rgba(255, 204, 41, 0.18);
+    --tm-rc-shadow: 0 10px 28px rgba(166, 106, 0, 0.14);
+    --tm-rc-success: #3f8f3a;
+    --tm-rc-success-rgb: 63, 143, 58;
+    --tm-rc-danger: #c9372c;
+    --tm-rc-danger-rgb: 201, 55, 44;
+    --tm-rc-warning: #b55d00;
+    --tm-rc-warning-rgb: 181, 93, 0;
+    --tm-rc-ai: #b55d00;
+    --tm-rc-ai-rgb: 181, 93, 0;
+}
+
+html[${ROOT_ATTRIBUTE}="tangerine"],
+html[${ROOT_ATTRIBUTE}="tangerine"] body.spring-ui-jupiter {
+    --tm-rc-primary: #c94f08;
+    --tm-rc-primary-rgb: 201, 79, 8;
+    --tm-rc-primary-strong: #9a3a04;
+    --tm-rc-primary-strong-rgb: 154, 58, 4;
+    --tm-rc-accent: #ff8a2b;
+    --tm-rc-accent-rgb: 255, 138, 43;
+    --tm-rc-accent-two: #ffc445;
+    --tm-rc-bg: #fff8f2;
+    --tm-rc-bg-rgb: 255, 248, 242;
+    --tm-rc-surface: #ffffff;
+    --tm-rc-surface-rgb: 255, 255, 255;
+    --tm-rc-surface-soft: #fff0e3;
+    --tm-rc-sidebar: #ffe9d6;
+    --tm-rc-text: #3d220f;
+    --tm-rc-text-rgb: 61, 34, 15;
+    --tm-rc-text-two: #5e3a22;
+    --tm-rc-text-two-rgb: 94, 58, 34;
+    --tm-rc-muted: #8a6a55;
+    --tm-rc-muted-rgb: 138, 106, 85;
+    --tm-rc-disabled-rgb: 204, 178, 160;
+    --tm-rc-border: #f7dcc6;
+    --tm-rc-border-rgb: 247, 220, 198;
+    --tm-rc-on-primary: #ffffff;
+    --tm-rc-on-primary-rgb: 255, 255, 255;
+    --tm-rc-header:
+        radial-gradient(circle at 58% 30%, rgba(255, 255, 255, 0.30) 0 7px, transparent 8px),
+        radial-gradient(circle at 66% 72%, rgba(255, 255, 255, 0.22) 0 11px, transparent 12px),
+        radial-gradient(circle at 79% 38%, rgba(255, 255, 255, 0.26) 0 5px, transparent 6px),
+        linear-gradient(110deg, #f06a0c 0%, #ff8a2b 55%, #ff9f45 100%);
+    --tm-rc-on-header: #ffffff;
+    --tm-rc-selected: rgba(201, 79, 8, 0.12);
+    --tm-rc-hover: rgba(255, 138, 43, 0.12);
+    --tm-rc-shadow: 0 10px 30px rgba(201, 79, 8, 0.16);
+    --tm-rc-success: #2f8a4f;
+    --tm-rc-success-rgb: 47, 138, 79;
+    --tm-rc-danger: #cc2f3b;
+    --tm-rc-danger-rgb: 204, 47, 59;
+    --tm-rc-warning: #b35300;
+    --tm-rc-warning-rgb: 179, 83, 0;
+    --tm-rc-ai: #c94f08;
+    --tm-rc-ai-rgb: 201, 79, 8;
+}
+
+html[${ROOT_ATTRIBUTE}="mint"],
+html[${ROOT_ATTRIBUTE}="mint"] body.spring-ui-jupiter {
+    --tm-rc-primary: #16895a;
+    --tm-rc-primary-rgb: 22, 137, 90;
+    --tm-rc-primary-strong: #0f6443;
+    --tm-rc-primary-strong-rgb: 15, 100, 67;
+    --tm-rc-accent: #3cc07e;
+    --tm-rc-accent-rgb: 60, 192, 126;
+    --tm-rc-accent-two: #ffd84f;
+    --tm-rc-bg: #f4fbf7;
+    --tm-rc-bg-rgb: 244, 251, 247;
+    --tm-rc-surface: #ffffff;
+    --tm-rc-surface-rgb: 255, 255, 255;
+    --tm-rc-surface-soft: #e8f7ef;
+    --tm-rc-sidebar: #def3e7;
+    --tm-rc-text: #14301f;
+    --tm-rc-text-rgb: 20, 48, 31;
+    --tm-rc-text-two: #2f4d3b;
+    --tm-rc-text-two-rgb: 47, 77, 59;
+    --tm-rc-muted: #5f7a6a;
+    --tm-rc-muted-rgb: 95, 122, 106;
+    --tm-rc-disabled-rgb: 160, 186, 171;
+    --tm-rc-border: #cde9d9;
+    --tm-rc-border-rgb: 205, 233, 217;
+    --tm-rc-on-primary: #ffffff;
+    --tm-rc-on-primary-rgb: 255, 255, 255;
+    --tm-rc-header:
+        radial-gradient(circle at 58% 30%, rgba(255, 255, 255, 0.26) 0 7px, transparent 8px),
+        radial-gradient(circle at 66% 72%, rgba(255, 255, 255, 0.18) 0 11px, transparent 12px),
+        radial-gradient(circle at 79% 38%, rgba(255, 255, 255, 0.22) 0 5px, transparent 6px),
+        linear-gradient(110deg, #13985a 0%, #26b06d 55%, #45c283 100%);
+    --tm-rc-on-header: #ffffff;
+    --tm-rc-selected: rgba(22, 137, 90, 0.12);
+    --tm-rc-hover: rgba(60, 192, 126, 0.12);
+    --tm-rc-shadow: 0 10px 30px rgba(22, 137, 90, 0.16);
+    --tm-rc-success: #1d7f4e;
+    --tm-rc-success-rgb: 29, 127, 78;
+    --tm-rc-danger: #cc3340;
+    --tm-rc-danger-rgb: 204, 51, 64;
+    --tm-rc-warning: #b86200;
+    --tm-rc-warning-rgb: 184, 98, 0;
+    --tm-rc-ai: #b86200;
+    --tm-rc-ai-rgb: 184, 98, 0;
 }
 
 /* RingCentral Spring/Jupiter tokens. Both the RGB-triplet legacy tokens and
@@ -432,6 +635,50 @@ html[${ROOT_ATTRIBUTE}] * {
     --tm-preview-border: #ddd2e4;
 }
 
+#${PANEL_ID} .tm-rc-theme-card[${VALUE_ATTRIBUTE}="strawberry"] {
+    --tm-preview-primary: #d6336c;
+    --tm-preview-accent: #ff6b9d;
+    --tm-preview-header: linear-gradient(100deg, #f0457f, #ff6b9d 55%, #ff85ad);
+    --tm-preview-bg: #fff6f9;
+    --tm-preview-surface: #ffffff;
+    --tm-preview-sidebar: #ffe6ef;
+    --tm-preview-text: #8a6475;
+    --tm-preview-border: #f7d3e0;
+}
+
+#${PANEL_ID} .tm-rc-theme-card[${VALUE_ATTRIBUTE}="lemon"] {
+    --tm-preview-primary: #a66a00;
+    --tm-preview-accent: #ffcc29;
+    --tm-preview-header: linear-gradient(100deg, #ffcc29, #ffd84f 55%, #ffe37a);
+    --tm-preview-bg: #fffcef;
+    --tm-preview-surface: #ffffff;
+    --tm-preview-sidebar: #fff3c4;
+    --tm-preview-text: #867a52;
+    --tm-preview-border: #f3e3a6;
+}
+
+#${PANEL_ID} .tm-rc-theme-card[${VALUE_ATTRIBUTE}="tangerine"] {
+    --tm-preview-primary: #c94f08;
+    --tm-preview-accent: #ff8a2b;
+    --tm-preview-header: linear-gradient(100deg, #f06a0c, #ff8a2b 55%, #ff9f45);
+    --tm-preview-bg: #fff8f2;
+    --tm-preview-surface: #ffffff;
+    --tm-preview-sidebar: #ffe9d6;
+    --tm-preview-text: #8a6a55;
+    --tm-preview-border: #f7dcc6;
+}
+
+#${PANEL_ID} .tm-rc-theme-card[${VALUE_ATTRIBUTE}="mint"] {
+    --tm-preview-primary: #16895a;
+    --tm-preview-accent: #3cc07e;
+    --tm-preview-header: linear-gradient(100deg, #13985a, #26b06d 55%, #45c283);
+    --tm-preview-bg: #f4fbf7;
+    --tm-preview-surface: #ffffff;
+    --tm-preview-sidebar: #def3e7;
+    --tm-preview-text: #5f7a6a;
+    --tm-preview-border: #cde9d9;
+}
+
 #${PANEL_ID} .tm-rc-theme-preview {
     position: relative;
     display: block;
@@ -466,7 +713,7 @@ html[${ROOT_ATTRIBUTE}] * {
     height: 14%;
     min-height: 13px;
     padding: 0 4%;
-    background: linear-gradient(100deg, var(--tm-preview-primary), var(--tm-preview-accent));
+    background: var(--tm-preview-header, linear-gradient(100deg, var(--tm-preview-primary), var(--tm-preview-accent)));
 }
 
 #${PANEL_ID} .tm-rc-theme-card[${VALUE_ATTRIBUTE}="dopamine"] .tm-rc-preview-topbar,
@@ -814,8 +1061,9 @@ html[${ROOT_ATTRIBUTE}] * {
         const group = createElement('div', 'tm-rc-theme-grid');
         group.setAttribute('role', 'radiogroup');
         group.setAttribute('aria-label', 'Custom RingCentral themes');
-        group.appendChild(createThemeCard('dopamine'));
-        group.appendChild(createThemeCard('macaron'));
+        CUSTOM_THEMES.forEach(function (theme) {
+            group.appendChild(createThemeCard(theme));
+        });
         group.appendChild(createThemeCard('default'));
 
         group.addEventListener('keydown', function (event) {
