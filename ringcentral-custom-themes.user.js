@@ -2,7 +2,7 @@
 // @name         RingCentral Dopamine & Macaron Themes
 // @name:zh-CN   RingCentral 多巴胺与马卡龙主题
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.0
+// @version      1.0.1
 // @description  Add vivid Dopamine and soft Macaron palettes to RingCentral Web, with native-looking choices on Settings > Themes.
 // @description:zh-CN  为 RingCentral Web 增加鲜艳的多巴胺主题与柔和的马卡龙主题，并在“设置 > 主题”中加入原生风格的选择卡片。
 // @author       Anna-SAP
@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.0';
+    const VERSION = '1.0.1';
     const STORAGE_KEY = 'tm-rc-custom-theme-v1';
     const ROOT_ATTRIBUTE = 'data-tm-rc-theme';
     const STYLE_ID = '__TM_RC_CUSTOM_THEME_STYLE__';
@@ -288,6 +288,14 @@ html[${ROOT_ATTRIBUTE}] #app-top-bar :where(p, span, div):not([data-test-automat
 html[${ROOT_ATTRIBUTE}] #app-top-bar svg {
     color: inherit !important;
     fill: currentColor;
+}
+
+/* Contained icon buttons (Dialpad, New actions) keep RingCentral's light
+   circular surface, so on-header ink would vanish on a dark header palette.
+   Ink them against their own surface instead of the header. */
+html[${ROOT_ATTRIBUTE}] #app-top-bar .RcIconButton-contained,
+html[${ROOT_ATTRIBUTE}] #app-top-bar .RcIconButton-contained :where(p, span, div) {
+    color: var(--tm-rc-primary-strong) !important;
 }
 
 html[${ROOT_ATTRIBUTE}] #nav-bar > .MuiDrawer-paper {
