@@ -1,0 +1,85 @@
+:root {
+    color-scheme: light dark;
+    --text: #1f1f1f;
+    --muted: #5f6368;
+    --border: #dadce0;
+    --hover: rgba(60, 64, 67, 0.08);
+    --active: rgba(60, 64, 67, 0.16);
+    --focus: #0b57d0;
+    --background: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --text: #e3e3e3;
+        --muted: #a8abaf;
+        --border: #5f6368;
+        --hover: rgba(232, 234, 237, 0.08);
+        --active: rgba(232, 234, 237, 0.16);
+        --focus: #a8c7fa;
+        --background: #202124;
+    }
+}
+
+body {
+    margin: 0;
+    padding: 8px;
+    background: var(--background);
+    color: var(--text);
+    font: 13px/1.4 system-ui, "Segoe UI", "Microsoft YaHei UI", sans-serif;
+}
+
+.zoom {
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+button {
+    border: 0;
+    margin: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+    background: var(--hover);
+}
+
+button:active:not(:disabled) {
+    background: var(--active);
+}
+
+button:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: -2px;
+}
+
+button:disabled {
+    color: var(--muted);
+    opacity: 0.5;
+    cursor: default;
+}
+
+#zoom-out,
+#zoom-in {
+    width: 40px;
+    height: 32px;
+    font-size: 18px;
+}
+
+#zoom-level {
+    min-width: 64px;
+    border-inline: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+}
+
+#message {
+    margin: 6px 2px 0;
+    max-width: 150px;
+    color: var(--muted);
+    font-size: 12px;
+}
