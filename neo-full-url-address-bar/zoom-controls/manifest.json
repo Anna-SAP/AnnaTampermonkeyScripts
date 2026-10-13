@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Neo Zoom Controls",
+  "description": "Page zoom controls in the toolbar: zoom out, current level (click to reset) and zoom in.",
+  "version": "1.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAn7nK2kw/CIRPgWGKTzaGELkM/zARMV3oOONfSa3tXBeCGi35lwo9/g5lpUU1oE20SQ+njDTap0KGmAd1mnj79H39Bepa7KgEgQeWSGaG9NNioDvGCEyxsI900rllJasDUKnwvMJ1NttxoJlfQjUZTn72zi68/BiCPbj1KTrXb2YT4/4XEoryqnDjdZySWdDKbl8I7H/zYci2FQLzLvc0E0bVq3cadpUvl0p7zqPLUfEnmYdfqggqzsuZOCu1vLJc1HNzIfM78K5S9+Au3E3S6g2uu6hYQfR23N2HIkglkCjmCvYzKgPZ5N6jrlhPsaHtz1q+LHrV7DyaSbWuYEIzPQIDAQAB",
+  "action": {
+    "default_title": "页面缩放",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
