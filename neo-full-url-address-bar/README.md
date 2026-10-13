@@ -24,10 +24,41 @@ Tampermonkey 等扩展被浏览器禁止注入这类界面，用户脚本改不�
 
 ## 使用
 
-需要 PowerShell 7.2+（`pwsh`）。
+启动参数和快捷方式的改动只对当前电脑有效，换一台电脑需要重新运行一次。
+
+### 1. 准备
+
+- 已安装 Neo，并且至少正常打开、关闭过一次，这样才会生成 profile。
+- 如果习惯从任务栏打开 Neo，先把 Neo 固定到任务栏再运行脚本。之后新固定的快捷方式不带启动参数，需要再运行一次。
+- 需要 PowerShell 7.2+。用 `pwsh -v` 确认版本，没有的话用 `winget install Microsoft.PowerShell` 安装。
+
+### 2. 获取脚本
+
+推荐克隆整个仓库：
+
+```bash
+git clone https://github.com/Anna-SAP/AnnaTampermonkeyScripts.git
+cd AnnaTampermonkeyScripts
+```
+
+也可以只下载这一个文件。如果公司网络拦截了 raw.githubusercontent.com，就改用上面的 `git clone`：
+
+```bash
+pwsh -Command "Invoke-WebRequest https://raw.githubusercontent.com/Anna-SAP/AnnaTampermonkeyScripts/main/neo-full-url-address-bar/Set-NeoFullUrlAddressBar.ps1 -OutFile Set-NeoFullUrlAddressBar.ps1"
+```
+
+用浏览器下载的文件会被 Windows 标记为「来自网络」，PowerShell 会拒绝运行。先解除标记：
+
+```bash
+pwsh -Command "Unblock-File .\Set-NeoFullUrlAddressBar.ps1"
+```
+
+### 3. 运行
+
+以下命令在仓库根目录执行。只下载了单个文件时，把路径换成文件所在的位置。
 
 1. 完全退出 Neo（包括后台进程），否则 Neo 退出时会覆盖偏好改动。脚本检测到 Neo 仍在运行时会拒绝执行。
-2. 先预览，不写入任何改动：
+2. 先预览，不写入任何改动。确认列出了任务栏快捷方式和 `NeoHTM`：
 
    ```bash
    pwsh -File neo-full-url-address-bar/Set-NeoFullUrlAddressBar.ps1 -WhatIf
@@ -39,7 +70,7 @@ Tampermonkey 等扩展被浏览器禁止注入这类界面，用户脚本改不�
    pwsh -File neo-full-url-address-bar/Set-NeoFullUrlAddressBar.ps1
    ```
 
-撤销全部改动：
+### 撤销
 
 ```bash
 pwsh -File neo-full-url-address-bar/Set-NeoFullUrlAddressBar.ps1 -Undo
@@ -47,6 +78,12 @@ pwsh -File neo-full-url-address-bar/Set-NeoFullUrlAddressBar.ps1 -Undo
 
 首次修改 `Preferences` 前，会在同目录备份一份 `Preferences.before-neo-full-url.bak`。
 可用 `-SkipPreferences`、`-SkipShortcuts`、`-SkipUrlHandlers` 跳过某一部分。
+
+## 常见问题
+
+- **提示「未找到 Neo」**：Neo 没有装在默认的 `C:\Program Files\Neo\Application\neo.exe`（例如装在了用户目录下）。用 `-NeoExe` 加上 `neo.exe` 的实际路径重新运行。
+- **预览里没有列出快捷方式**：任务栏图标可能是在运行脚本之后才固定的，固定后重新运行。
+- **运行后仍然只显示域名**：先完全退出 Neo，再从任务栏或开始菜单打开。如果还是不行，在地址栏打开 `chrome://settings/help` 查看 Neo 版本，`NavigatorReadOnlyOmnibox` 只在 154.0.8603.100 上确认过。
 
 ## 注意
 
