@@ -9,10 +9,13 @@
     managers such as Tampermonkey cannot reach it. This script applies the
     browser-level settings that do work:
 
-    1. Launch switches, added to every shortcut that targets neo.exe (Start menu,
-       taskbar pins, desktop) and to the "open link" command used when Neo is the
-       default browser (HKCU\Software\Classes\NeoHTM / NeoPDF, which override the
-       HKLM registration without needing admin rights):
+    1. Launch switches. Neo only reads them when its browser process starts, so
+       they are added to every entry point that can cold-start Neo:
+         - shortcuts that target neo.exe or chrome_proxy.exe (Start menu, taskbar
+           pins, desktop, and the installed web app shortcuts under "Neo 应用");
+         - every registry command that launches Neo (NeoHTM / NeoPDF for links
+           and files, the neo: protocol, ...). Machine-wide ones get a per-user
+           override under HKCU\Software\Classes, so no admin rights are needed.
          --disable-features=NavigatorReadOnlyOmnibox
              Falls back to the standard Chromium omnibox, which honours "always
              show full URLs" instead of showing the domain only.
@@ -30,6 +33,12 @@
          extensions.pinned_extensions     += the zoom extension, placed next to the address bar
     3. Copies zoom-controls\ to ExtensionDir, so the extension keeps working if
        this repository is moved or deleted.
+    4. Logon repair: copies this script to %LOCALAPPDATA%\NeoToolbarTweaks and
+       adds a hidden HKCU Run entry that re-applies the switches at every Windows
+       logon, because Neo updates and newly installed web apps recreate shortcuts
+       without them. With -LaunchAtLogon it also opens Neo with the switches, so
+       even launches the script cannot patch (notification clicks, jump lists,
+       other programs) join a correctly configured browser process.
 
     Neo must be fully closed while the script runs. -Undo reverts everything and
     -WhatIf previews the changes without writing anything.
@@ -38,6 +47,8 @@
     pwsh -File .\Set-NeoFullUrlAddressBar.ps1 -WhatIf
 .EXAMPLE
     pwsh -File .\Set-NeoFullUrlAddressBar.ps1
+.EXAMPLE
+    pwsh -File .\Set-NeoFullUrlAddressBar.ps1 -LaunchAtLogon
 .EXAMPLE
     pwsh -File .\Set-NeoFullUrlAddressBar.ps1 -KeepVerticalTabsButton -NoZoomControls
 .EXAMPLE
@@ -48,6 +59,10 @@ param(
     [switch]$Undo,
     [switch]$KeepVerticalTabsButton,
     [switch]$NoZoomControls,
+    [switch]$LaunchAtLogon,
+    [switch]$NoLogonRepair,
+    # Used by the Run entry: re-patch launch entry points quietly, logging to a file.
+    [switch]$LogonRepair,
     [string]$UserDataDir = (Join-Path $env:LOCALAPPDATA 'Neo\User Data'),
     [string]$NeoExe = (Join-Path $env:ProgramFiles 'Neo\Application\neo.exe'),
     [string]$ExtensionDir = (Join-Path $env:LOCALAPPDATA 'NeoToolbarTweaks\zoom-controls'),
@@ -58,13 +73,15 @@ param(
         (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu'),
         (Join-Path $env:PUBLIC 'Desktop')
     ),
-    [string[]]$ProgIds = @('NeoHTM', 'NeoPDF'),
+    # Registry ProgIds / protocols to patch. Default: every one whose command launches Neo.
+    [string[]]$ProgIds,
     [switch]$SkipPreferences,
     [switch]$SkipShortcuts,
     [switch]$SkipUrlHandlers
 )
 
 $ErrorActionPreference = 'Stop'
+$ScriptParameters = $PSBoundParameters
 
 # Set on HKCU ProgId keys this script creates, so -Undo deletes only those.
 $Marker = 'NeoFullUrlAddressBar'
@@ -77,8 +94,23 @@ $PrefSettings = [ordered]@{
 $ExtensionSource = Join-Path $PSScriptRoot 'zoom-controls'
 # Derived from the "key" in zoom-controls\manifest.json, so it is the same on every machine.
 $ZoomExtensionId = 'pfoejdcoooobifjhbnemjanhjlkkgbea'
+$InstallDir = Join-Path $env:LOCALAPPDATA 'NeoToolbarTweaks'
+$InstalledScript = Join-Path $InstallDir 'Set-NeoFullUrlAddressBar.ps1'
+$RunKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Run'
+$RunValueName = 'NeoToolbarTweaks'
+$WantLogonEntry = -not $Undo -and (-not $NoLogonRepair -or $LaunchAtLogon)
 
+$NeoExe = [IO.Path]::GetFullPath($NeoExe)
+# Web app shortcuts start Neo through chrome_proxy.exe, which forwards its arguments.
+$NeoLaunchers = @($NeoExe, (Join-Path (Split-Path $NeoExe) 'chrome_proxy.exe'))
 $ExtensionDir = [IO.Path]::GetFullPath($ExtensionDir).TrimEnd('\')
+
+if ($LogonRepair) {
+    # Neo may be starting at the same time, so leave its Preferences alone.
+    $SkipPreferences = $true
+    New-Item -ItemType Directory -Force $InstallDir | Out-Null
+    Start-Transcript -LiteralPath (Join-Path $InstallDir 'logon-repair.log') -Force | Out-Null
+}
 $ZoomAvailable = (Test-Path -LiteralPath (Join-Path $ExtensionSource 'manifest.json')) -or
     (Test-Path -LiteralPath (Join-Path $ExtensionDir 'manifest.json'))
 $WantZoom = -not $Undo -and -not $NoZoomControls -and $ZoomAvailable
@@ -93,6 +125,7 @@ $ExtensionsOn = if ($WantZoom) { @($ExtensionDir) } else { @() }
 $ExtensionsOff = if ($WantZoom) { @() } else { @($ExtensionDir) }
 
 $script:Changed = 0
+$script:NeedsAdmin = @()
 
 function Write-Step([string]$Message) { Write-Host "`n== $Message" -ForegroundColor Cyan }
 function Write-Done([string]$Message) { $script:Changed++; Write-Host "  [改] $Message" -ForegroundColor Green }
@@ -150,8 +183,6 @@ function Get-RunningNeo {
 
 function Update-ZoomExtension {
     Write-Step "缩放按钮扩展文件（$ExtensionDir）"
-    if ($ExtensionDir -ieq (Get-NormalizedPath $ExtensionSource)) { Write-Same '直接使用仓库中的 zoom-controls'; return }
-
     if (-not $WantZoom) {
         if (-not $Undo -and -not $NoZoomControls) {
             Write-Warning "未找到 $ExtensionSource，跳过缩放按钮（请用 git clone 或 Download ZIP 获取完整仓库）"
@@ -166,6 +197,8 @@ function Update-ZoomExtension {
         return
     }
 
+    # Running the installed copy of this script: source and target are the same folder.
+    if ($ExtensionDir -ieq (Get-NormalizedPath $ExtensionSource)) { Write-Same '使用已部署的版本'; return }
     if (-not (Test-Path -LiteralPath $ExtensionSource)) {
         Write-Warning "未找到 $ExtensionSource，沿用已部署的版本"
         return
@@ -294,15 +327,14 @@ function Update-Preferences {
 }
 
 function Update-Shortcuts {
-    Write-Step '快捷方式启动参数'
-    $exe = Get-NormalizedPath $NeoExe
+    Write-Step '快捷方式启动参数（Neo 与网页应用）'
     $shell = New-Object -ComObject WScript.Shell
     $found = 0
     foreach ($root in $ShortcutRoots | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) {
         # -Force: taskbar pins live under the hidden "User Pinned" folder.
         foreach ($item in Get-ChildItem -LiteralPath $root -Recurse -Force -Filter *.lnk -File -ErrorAction SilentlyContinue) {
             $lnk = $shell.CreateShortcut($item.FullName)
-            if (-not $lnk.TargetPath -or (Get-NormalizedPath $lnk.TargetPath) -ine $exe) { continue }
+            if (-not $lnk.TargetPath -or $NeoLaunchers -inotcontains (Get-NormalizedPath $lnk.TargetPath)) { continue }
             $found++
             $new = Edit-NeoSwitches $lnk.Arguments
             if ($new -ceq "$($lnk.Arguments)") { Write-Same $item.FullName; continue }
@@ -313,17 +345,38 @@ function Update-Shortcuts {
                     Write-Done "$($item.FullName)`n         参数：'$new'"
                 }
                 catch {
-                    Write-Warning "无法修改（该位置需要管理员权限，可用管理员 PowerShell 重跑）：$($item.FullName)"
+                    $script:NeedsAdmin += $item.FullName
+                    Write-Warning "无法修改（需要管理员权限）：$($item.FullName)"
                 }
             }
         }
     }
-    if (-not $found) { Write-Warning "没有找到指向 $exe 的快捷方式" }
+    if (-not $found) { Write-Warning "没有找到启动 Neo 的快捷方式" }
+}
+
+# ProgIds and protocols whose open command launches Neo, from both hives (HKCU
+# entries include the overrides this script created earlier).
+function Find-NeoProgIds {
+    $launcher = '(?i)' + [regex]::Escape((Split-Path $NeoExe)) + '\\(neo|chrome_proxy)\.exe'
+    $names = foreach ($hive in [Microsoft.Win32.Registry]::CurrentUser, [Microsoft.Win32.Registry]::LocalMachine) {
+        $classes = $hive.OpenSubKey('Software\Classes')
+        try {
+            foreach ($name in $classes.GetSubKeyNames()) {
+                $command = $classes.OpenSubKey("$name\shell\open\command")
+                if (-not $command) { continue }
+                if ("$($command.GetValue(''))" -match $launcher) { $name }
+                $command.Dispose()
+            }
+        }
+        finally { $classes.Dispose() }
+    }
+    @($names | Sort-Object -Unique)
 }
 
 function Update-UrlHandlers {
-    Write-Step '默认浏览器打开链接的命令（HKCU\Software\Classes）'
-    foreach ($progId in $ProgIds) {
+    Write-Step '注册表中启动 Neo 的命令（链接、文件、协议）'
+    $targets = if ($ProgIds) { $ProgIds } else { Find-NeoProgIds }
+    foreach ($progId in $targets) {
         $userPath = "Software\Classes\$progId"
         $userKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($userPath, $true)
         $machineKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("Software\Classes\$progId")
@@ -388,6 +441,68 @@ function Update-UrlHandlers {
     }
 }
 
+# The Run entry starts the installed copy of this script without a console window
+# and passes on the options of this run, so the logon repair keeps them.
+function Get-LogonCommand {
+    $parts = @(
+        "`"$(Join-Path $env:SystemRoot 'System32\conhost.exe')`"", '--headless',
+        "`"$((Get-Process -Id $PID).Path)`"", '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', "`"$InstalledScript`"", '-LogonRepair'
+    )
+    foreach ($name in 'KeepVerticalTabsButton', 'NoZoomControls', 'LaunchAtLogon') {
+        if ($ScriptParameters[$name]) { $parts += "-$name" }
+    }
+    foreach ($name in 'UserDataDir', 'NeoExe', 'ExtensionDir') {
+        if ($ScriptParameters.ContainsKey($name)) { $parts += "-$name", "`"$($ScriptParameters[$name])`"" }
+    }
+    $parts -join ' '
+}
+
+function Update-LogonEntry {
+    Write-Step "登录时自动修补（HKCU\$RunKeyPath\$RunValueName）"
+    $runKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($RunKeyPath)
+    try {
+        $current = $runKey.GetValue($RunValueName)
+        if (-not $WantLogonEntry) {
+            if ($null -eq $current) { Write-Same '未设置' }
+            elseif ($PSCmdlet.ShouldProcess("HKCU\$RunKeyPath\$RunValueName", '删除')) {
+                $runKey.DeleteValue($RunValueName)
+                Write-Done "已删除 HKCU\$RunKeyPath\$RunValueName"
+            }
+            foreach ($file in $InstalledScript, (Join-Path $InstallDir 'logon-repair.log')) {
+                if ((Test-Path -LiteralPath $file) -and $PSCmdlet.ShouldProcess($file, '删除')) {
+                    Remove-Item -LiteralPath $file -Force
+                    Write-Done "已删除 $file"
+                }
+            }
+            if ((Test-Path -LiteralPath $InstallDir) -and -not (Get-ChildItem -LiteralPath $InstallDir -Force) -and
+                $PSCmdlet.ShouldProcess($InstallDir, '删除空目录')) {
+                Remove-Item -LiteralPath $InstallDir
+            }
+            return
+        }
+
+        if ((Get-NormalizedPath $PSCommandPath) -ine (Get-NormalizedPath $InstalledScript)) {
+            if ((Test-Path -LiteralPath $InstalledScript) -and
+                (Get-FileHash -LiteralPath $InstalledScript).Hash -eq (Get-FileHash -LiteralPath $PSCommandPath).Hash) {
+                Write-Same "$InstalledScript 已是最新"
+            }
+            elseif ($PSCmdlet.ShouldProcess($InstalledScript, '复制本脚本')) {
+                New-Item -ItemType Directory -Force $InstallDir | Out-Null
+                Copy-Item -LiteralPath $PSCommandPath -Destination $InstalledScript -Force
+                Write-Done "已复制脚本到 $InstalledScript"
+            }
+        }
+        $command = Get-LogonCommand
+        if ($current -ceq $command) { Write-Same $command }
+        elseif ($PSCmdlet.ShouldProcess("HKCU\$RunKeyPath\$RunValueName", "设为 $command")) {
+            $runKey.SetValue($RunValueName, $command, 'String')
+            Write-Done "HKCU\$RunKeyPath\$RunValueName`n         $command"
+        }
+    }
+    finally { $runKey.Dispose() }
+}
+
 if (-not (Test-Path -LiteralPath $NeoExe)) { throw "未找到 Neo：$NeoExe（可用 -NeoExe 指定路径）" }
 
 if (-not $SkipPreferences -and (Get-RunningNeo)) {
@@ -400,12 +515,32 @@ Update-ZoomExtension
 if (-not $SkipPreferences) { Update-Preferences }
 if (-not $SkipShortcuts) { Update-Shortcuts }
 if (-not $SkipUrlHandlers) { Update-UrlHandlers }
+if (-not $LogonRepair) { Update-LogonEntry }
 
+if ($LogonRepair) {
+    if ($LaunchAtLogon -and -not $Undo) {
+        if (Get-RunningNeo) { Write-Same 'Neo 已在运行，不再启动' }
+        else {
+            $arguments = Edit-NeoSwitches ''
+            if ($ScriptParameters.ContainsKey('UserDataDir')) { $arguments = "--user-data-dir=`"$UserDataDir`" $arguments" }
+            Start-Process -FilePath $NeoExe -ArgumentList $arguments
+            Write-Done "已启动 Neo：$arguments"
+        }
+    }
+    Stop-Transcript | Out-Null
+    return
+}
+
+if ($script:NeedsAdmin) {
+    Write-Host "`n以下快捷方式需要管理员权限才能修改（例如开始菜单搜索「Neo」打开的就是它）：" -ForegroundColor Yellow
+    $script:NeedsAdmin | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+    Write-Host '请以管理员身份打开 PowerShell，用相同的参数再运行一次本脚本。' -ForegroundColor Yellow
+}
 if ($WhatIfPreference) {
     Write-Host "`n以上为预览（-WhatIf），未写入任何改动。" -ForegroundColor Yellow
 }
 elseif ($script:Changed) {
-    Write-Host "`n完成，共 $script:Changed 处改动。现在从任务栏/开始菜单重新打开 Neo 即可生效。" -ForegroundColor Yellow
+    Write-Host "`n完成，共 $script:Changed 处改动。请完全退出 Neo，再从任务栏或开始菜单重新打开。" -ForegroundColor Yellow
 }
 else {
     Write-Host "`n没有需要改动的地方。" -ForegroundColor Yellow
