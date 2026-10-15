@@ -9,10 +9,12 @@
     managers such as Tampermonkey cannot reach it. This script applies the
     browser-level settings that do work:
 
-    1. Launch switches, added to every shortcut that targets neo.exe (Start menu,
+    1. Launch switches, added to current-user shortcuts that target neo.exe (Start menu,
        taskbar pins, desktop) and to the "open link" command used when Neo is the
-       default browser (HKCU\Software\Classes\NeoHTM / NeoPDF, which override the
-       HKLM registration without needing admin rights):
+       default browser (HKCU\Software\Classes\NeoHTM / NeoPDF, including the
+       NeoHTM.<install id> form of per-user installs; HKCU keys override the
+       HKLM registration without needing admin rights), and to an existing
+       current-user Run entry that starts Neo at sign-in:
          --disable-features=NavigatorReadOnlyOmnibox
              Falls back to the standard Chromium omnibox, which honours "always
              show full URLs" instead of showing the domain only.
@@ -30,6 +32,8 @@
          extensions.pinned_extensions     += the zoom extension, placed next to the address bar
     3. Copies zoom-controls\ to ExtensionDir, so the extension keeps working if
        this repository is moved or deleted.
+    4. Discovers Neo on this device, deploys a stable launcher and maintains
+       startup entry points at sign-in. Maintenance never writes Preferences.
 
     Neo must be fully closed while the script runs. -Undo reverts everything and
     -WhatIf previews the changes without writing anything.
@@ -49,8 +53,9 @@ param(
     [switch]$KeepVerticalTabsButton,
     [switch]$NoZoomControls,
     [string]$UserDataDir = (Join-Path $env:LOCALAPPDATA 'Neo\User Data'),
-    [string]$NeoExe = (Join-Path $env:ProgramFiles 'Neo\Application\neo.exe'),
+    [string]$NeoExe,
     [string]$ExtensionDir = (Join-Path $env:LOCALAPPDATA 'NeoToolbarTweaks\zoom-controls'),
+    [string]$StateDir = (Join-Path $env:LOCALAPPDATA 'NeoToolbarTweaks'),
     [string[]]$ShortcutRoots = @(
         (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu'),
         (Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch'),
@@ -61,14 +66,41 @@ param(
     [string[]]$ProgIds = @('NeoHTM', 'NeoPDF'),
     [switch]$SkipPreferences,
     [switch]$SkipShortcuts,
-    [switch]$SkipUrlHandlers
+    [switch]$SkipUrlHandlers,
+    [switch]$SkipAutoStart,
+    [switch]$NoAutoRepair,
+    [switch]$Maintenance
 )
 
 $ErrorActionPreference = 'Stop'
+$NeoExeWasExplicit = $PSBoundParameters.ContainsKey('NeoExe') -and -not [string]::IsNullOrWhiteSpace($NeoExe)
+. (Join-Path $PSScriptRoot 'NeoPaths.ps1')
+. (Join-Path $PSScriptRoot 'NeoPersistence.ps1')
 
 # Set on HKCU ProgId keys this script creates, so -Undo deletes only those.
 $Marker = 'NeoFullUrlAddressBar'
 $BackupSuffix = '.before-neo-full-url.bak'
+$savedSettings = $null
+$settingsFile = Join-Path $StateDir 'settings.json'
+if (Test-Path -LiteralPath $settingsFile -PathType Leaf) {
+    try {
+        $candidateSettings = Get-Content -LiteralPath $settingsFile -Raw | ConvertFrom-Json
+        if ($candidateSettings.Owner -eq $Marker -and $candidateSettings.SchemaVersion -eq 1) { $savedSettings = $candidateSettings }
+    }
+    catch { Write-Warning "无法读取之前的工具栏设置：$settingsFile" }
+}
+$PreferredNeoExe = if ($NeoExeWasExplicit) { $NeoExe } elseif ($savedSettings) { [string]$savedSettings.PreferredNeoExe } else { '' }
+if ($savedSettings) {
+    # Reinstallation and removal reuse this device's custom paths unless overridden.
+    foreach ($name in @('UserDataDir', 'ExtensionDir', 'ShortcutRoots', 'ProgIds', 'KeepVerticalTabsButton',
+        'NoZoomControls', 'SkipPreferences', 'SkipShortcuts', 'SkipUrlHandlers', 'SkipAutoStart', 'NoAutoRepair')) {
+        if (-not $PSBoundParameters.ContainsKey($name) -and $null -ne $savedSettings.$name) { Set-Variable -Name $name -Value $savedSettings.$name }
+    }
+    if (-not $NeoExeWasExplicit) {
+        if ($Undo) { $NeoExe = if ($PreferredNeoExe) { $PreferredNeoExe } else { $savedSettings.NeoExeHint } }
+        elseif ($PreferredNeoExe -and (Test-Path -LiteralPath $PreferredNeoExe -PathType Leaf)) { $NeoExe = $PreferredNeoExe }
+    }
+}
 $PrefSettings = [ordered]@{
     'omnibox.prevent_url_elisions'     = $true
     'navigator.omnibox.use_full_width' = $true
@@ -108,25 +140,37 @@ function Get-NormalizedPath([string]$Path) {
 # goes before --single-argument, since everything after that is treated as one URL.
 function Edit-SwitchList([string]$Arguments, [string]$Name, [string[]]$Add, [string[]]$Remove) {
     $Arguments = "$Arguments"
+    # --single-argument consumes the remaining text as a URL; never edit it as flags.
+    $singleArgument = [regex]::Match($Arguments, '(?<=^|\s)--single-argument(?=\s|$)')
+    if ($singleArgument.Success) {
+        $head = Edit-SwitchList $Arguments.Substring(0, $singleArgument.Index).TrimEnd() $Name $Add $Remove
+        return ("$head " + $Arguments.Substring($singleArgument.Index)).TrimStart()
+    }
     # @(... | Where-Object) also turns a $null list into an empty one.
     $Add = @($Add | Where-Object { $_ })
     $Remove = @($Remove | Where-Object { $_ })
     $same = { param($a, $b) $a.TrimEnd('\') -ieq $b.TrimEnd('\') }
-    $m = [regex]::Match($Arguments, "(^|\s+)--$([regex]::Escape($Name))=(?:""([^""]*)""|(\S*))")
-    $items = @(if ($m.Success) { ($m.Groups[2].Value + $m.Groups[3].Value) -split ',' | Where-Object { $_ } })
-    $result = @($items | Where-Object { $item = $_; -not ($Remove | Where-Object { & $same $item $_ }) })
+    $pattern = "(^|\s+)--$([regex]::Escape($Name))=(?:""([^""]*)""|(\S*))"
+    $matchesFound = [regex]::Matches($Arguments, $pattern)
+    $items = @(foreach ($m in $matchesFound) { ($m.Groups[2].Value + $m.Groups[3].Value) -split ',' | Where-Object { $_ } })
+    $result = @()
+    foreach ($item in $items) {
+        if (-not ($Remove | Where-Object { & $same $item $_ }) -and
+            -not ($result | Where-Object { & $same $item $_ })) { $result += $item }
+    }
     foreach ($wanted in $Add) {
         if (-not ($result | Where-Object { & $same $_ $wanted })) { $result += $wanted }
     }
     $value = $result -join ','
     $switch = if ($result.Count) { "--$Name=" + ($value -match '\s' ? """$value""" : $value) } else { '' }
-    if ($m.Success) {
+    if ($matchesFound.Count -eq 1) {
+        $m = $matchesFound[0]
         $replacement = if ($switch) { $m.Groups[1].Value + $switch } else { '' }
         return ($Arguments.Substring(0, $m.Index) + $replacement + $Arguments.Substring($m.Index + $m.Length)).Trim()
     }
+    # Collapse duplicate switches too: Chromium otherwise honours only the last.
+    if ($matchesFound.Count -gt 1) { $Arguments = [regex]::Replace($Arguments, $pattern, '').Trim() }
     if (-not $switch) { return $Arguments }
-    $single = [regex]::Match($Arguments, '(?<=^|\s)--single-argument(?=\s|$)')
-    if ($single.Success) { return $Arguments.Insert($single.Index, "$switch ") }
     return "$Arguments $switch".Trim()
 }
 
@@ -138,7 +182,12 @@ function Edit-NeoSwitches([string]$Arguments) {
 function Get-RunningNeo {
     $target = Get-NormalizedPath $UserDataDir
     $default = Get-NormalizedPath (Join-Path $env:LOCALAPPDATA 'Neo\User Data')
-    Get-CimInstance Win32_Process -Filter "Name='neo.exe'" | Where-Object {
+    try { $processes = @(Get-CimInstance Win32_Process -Filter "Name='neo.exe'" -ErrorAction Stop) }
+    catch {
+        # If WMI is unavailable, err on the side of protecting the open profile.
+        return @(Get-Process neo -ErrorAction SilentlyContinue)
+    }
+    $processes | Where-Object {
         # Only the browser process (child processes carry --type=) of the same
         # user data directory writes Preferences.
         if ($null -eq $_.CommandLine) { return $true }
@@ -150,13 +199,20 @@ function Get-RunningNeo {
 
 function Update-ZoomExtension {
     Write-Step "缩放按钮扩展文件（$ExtensionDir）"
-    if ($ExtensionDir -ieq (Get-NormalizedPath $ExtensionSource)) { Write-Same '直接使用仓库中的 zoom-controls'; return }
+    $ownedInstalledSource = $Undo -and $savedSettings -and (Get-NormalizedPath $PSScriptRoot) -ieq (Get-NormalizedPath $StateDir)
+    if ($ExtensionDir -ieq (Get-NormalizedPath $ExtensionSource) -and -not $ownedInstalledSource) { Write-Same '直接使用仓库中的 zoom-controls'; return }
 
     if (-not $WantZoom) {
         if (-not $Undo -and -not $NoZoomControls) {
             Write-Warning "未找到 $ExtensionSource，跳过缩放按钮（请用 git clone 或 Download ZIP 获取完整仓库）"
         }
         if (-not (Test-Path -LiteralPath $ExtensionDir)) { Write-Same '未部署'; return }
+        $deleteTarget = Get-NormalizedPath $ExtensionDir
+        if ($deleteTarget -ieq [IO.Path]::GetPathRoot($deleteTarget).TrimEnd('\') -or
+            $deleteTarget -ieq (Get-NormalizedPath $env:LOCALAPPDATA) -or
+            $deleteTarget -ieq (Get-NormalizedPath $StateDir)) {
+            throw "拒绝递归删除非扩展目录：$deleteTarget"
+        }
         if ($PSCmdlet.ShouldProcess($ExtensionDir, '删除')) {
             Remove-Item -LiteralPath $ExtensionDir -Recurse -Force
             $parent = Split-Path $ExtensionDir
@@ -302,13 +358,29 @@ function Update-Shortcuts {
         # -Force: taskbar pins live under the hidden "User Pinned" folder.
         foreach ($item in Get-ChildItem -LiteralPath $root -Recurse -Force -Filter *.lnk -File -ErrorAction SilentlyContinue) {
             $lnk = $shell.CreateShortcut($item.FullName)
-            if (-not $lnk.TargetPath -or (Get-NormalizedPath $lnk.TargetPath) -ine $exe) { continue }
+            if (-not $lnk.TargetPath -or [IO.Path]::GetFileName($lnk.TargetPath) -ine 'neo.exe') { continue }
+            $target = Get-NormalizedPath $lnk.TargetPath
+            # Repair obsolete install paths, but leave a different, valid Neo installation alone.
+            if ($target -ine $exe -and (Test-Path -LiteralPath $target -PathType Leaf)) { continue }
+            $shared = $false
+            foreach ($sharedRoot in @($env:ProgramData, $env:PUBLIC) | Where-Object { $_ }) {
+                $prefix = (Get-NormalizedPath $sharedRoot) + '\'
+                if ($item.FullName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $shared = $true }
+            }
+            if ($shared -and -not $Undo) {
+                Write-Warning "保留所有用户的快捷方式：$($item.FullName)。使用本用户的「Neo（工具栏增强）」入口。"
+                continue
+            }
             $found++
             $new = Edit-NeoSwitches $lnk.Arguments
-            if ($new -ceq "$($lnk.Arguments)") { Write-Same $item.FullName; continue }
+            if ($new -ceq "$($lnk.Arguments)" -and $target -ieq $exe) { Write-Same $item.FullName; continue }
             if ($PSCmdlet.ShouldProcess($item.FullName, "参数改为 '$new'")) {
                 try {
                     $lnk.Arguments = $new
+                    if (-not $Undo) {
+                        $lnk.TargetPath = $exe
+                        if (-not (Test-Path -LiteralPath $lnk.WorkingDirectory -PathType Container)) { $lnk.WorkingDirectory = Split-Path $exe }
+                    }
                     $lnk.Save()
                     Write-Done "$($item.FullName)`n         参数：'$new'"
                 }
@@ -323,7 +395,7 @@ function Update-Shortcuts {
 
 function Update-UrlHandlers {
     Write-Step '默认浏览器打开链接的命令（HKCU\Software\Classes）'
-    foreach ($progId in $ProgIds) {
+    foreach ($progId in @(Get-NeoProgIdNames -ProgIds $ProgIds)) {
         $userPath = "Software\Classes\$progId"
         $userKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($userPath, $true)
         $machineKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("Software\Classes\$progId")
@@ -346,7 +418,8 @@ function Update-UrlHandlers {
                     if ($machineCommandKey) { $machineCommand = $machineCommandKey.GetValue(''); $machineCommandKey.Dispose() }
                 }
                 if (-not $machineCommand) { Write-Same "未注册 $progId，跳过"; continue }
-                $new = Edit-NeoSwitches $machineCommand
+                $new = Edit-NeoCommandLine $machineCommand
+                if ($new -ceq $machineCommand) { Write-Same "$progId 不是本次 Neo 安装的打开命令"; continue }
                 if ($PSCmdlet.ShouldProcess("HKCU\$userPath", "新建，打开命令为 $new")) {
                     $created = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($userPath)
                     try {
@@ -372,7 +445,7 @@ function Update-UrlHandlers {
             if (-not $commandKey) { Write-Same "HKCU\$userPath 没有打开命令，跳过"; continue }
             try {
                 $current = "$($commandKey.GetValue('', $null, 'DoNotExpandEnvironmentNames'))"
-                $new = Edit-NeoSwitches $current
+                $new = Edit-NeoCommandLine $current -Managed:([bool]$userKey.GetValue($Marker))
                 if ($new -ceq $current) { Write-Same "HKCU\$userPath\shell\open\command"; continue }
                 if ($PSCmdlet.ShouldProcess("HKCU\$userPath\shell\open\command", "改为 $new")) {
                     $commandKey.SetValue('', $new, $commandKey.GetValueKind(''))
@@ -388,8 +461,23 @@ function Update-UrlHandlers {
     }
 }
 
-if (-not (Test-Path -LiteralPath $NeoExe)) { throw "未找到 Neo：$NeoExe（可用 -NeoExe 指定路径）" }
+if ($Undo -and $NeoExe) {
+    # Removal does not require the old executable to remain installed.
+    $NeoExe = ConvertTo-NeoExecutablePath $NeoExe
+    if (-not $NeoExe) { throw '无法识别要撤销的 Neo 路径，请用 -NeoExe 指定原来的 neo.exe 路径。' }
+}
+else {
+    try { $NeoExe = Resolve-NeoExecutable -ExplicitPath $NeoExe -ShortcutRoots $ShortcutRoots -ProgIds $ProgIds -HintPath $savedSettings.NeoExeHint }
+    catch {
+        if (-not $Undo) { throw }
+        $NeoExe = Join-Path $env:ProgramFiles 'Neo\Application\neo.exe'
+        Write-Warning 'Neo 已卸载；继续清理本工具的运行文件和失效入口。'
+    }
+}
+if ($NeoExeWasExplicit) { $PreferredNeoExe = $NeoExe }
+Write-Host "Neo 程序：$NeoExe" -ForegroundColor Cyan
 
+if ($Maintenance) { $SkipPreferences = $true }
 if (-not $SkipPreferences -and (Get-RunningNeo)) {
     $message = 'Neo 仍在运行（可能在后台/托盘）。请先完全退出 Neo，否则它退出时会覆盖 Preferences 的改动。'
     if ($WhatIfPreference) { Write-Warning $message } else { throw $message }
@@ -400,12 +488,15 @@ Update-ZoomExtension
 if (-not $SkipPreferences) { Update-Preferences }
 if (-not $SkipShortcuts) { Update-Shortcuts }
 if (-not $SkipUrlHandlers) { Update-UrlHandlers }
+if (-not $SkipAutoStart) { Update-NeoAutoStart }
+if (-not $Maintenance) { Update-NeoToolbarRuntime }
 
 if ($WhatIfPreference) {
     Write-Host "`n以上为预览（-WhatIf），未写入任何改动。" -ForegroundColor Yellow
 }
 elseif ($script:Changed) {
-    Write-Host "`n完成，共 $script:Changed 处改动。现在从任务栏/开始菜单重新打开 Neo 即可生效。" -ForegroundColor Yellow
+    $completion = if ($Undo) { "完成撤销，共 $script:Changed 处改动。" } else { "完成，共 $script:Changed 处改动。请完全退出 Neo，再从开始菜单的「Neo（工具栏增强）」打开。" }
+    Write-Host "`n$completion" -ForegroundColor Yellow
 }
 else {
     Write-Host "`n没有需要改动的地方。" -ForegroundColor Yellow
