@@ -2,7 +2,7 @@
 // @name         Grok Bot Message Time
 // @name:zh-CN   Grok Bot 消息精确时间
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.0
+// @version      1.1.0
 // @description  Show the exact send time on each Grok Bot message. The grok.com/bot transcript hides precise timestamps; this reads them from the page's own loaded transcript and paints a clock on the message card.
 // @description:zh-CN 在 grok.com/bot 的每条 Bot 消息上显示精确发送时间。页面只给出「周一早上」「傍晚」这类说法，脚本从页面已经加载的会话数据里取出时间戳，标在对应消息块顶部。
 // @author       Anna-SAP
@@ -23,9 +23,11 @@
     const MIN_MS = Date.UTC(2020, 0, 1);
     const MAX_FUTURE_MS = 36 * 60 * 60 * 1000;
     const TIME_FIELDS = [
-        'timestampMs', 'timestamp_ms', 'sentAtMs', 'sent_at_ms',
+        'timestampMs', 'timestamp_ms', 'timestamp', 'sentAtMs', 'sent_at_ms',
         'createdAtMs', 'created_at_ms', 'createTime', 'createdAt',
-        'created_at', 'sentAt', 'sent_at', 'composedAtMs', 'create_time',
+        'created_at', 'sentAt', 'sent_at', 'sentTime', 'sent_time',
+        'sendTime', 'send_time', 'postedAt', 'posted_at',
+        'messageTime', 'message_time', 'composedAtMs', 'create_time',
         'updatedAtMs', 'updated_at_ms'
     ];
     const MOUNT_TAGS = new Set(['DIV', 'ARTICLE', 'SECTION', 'LI', 'MAIN', 'BLOCKQUOTE']);
@@ -80,41 +82,91 @@
         return String(value || '')
             .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
             .replace(/\u00a0/g, ' ')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&quot;/gi, '"')
+            .replace(/&#39;|&apos;/gi, "'")
+            .replace(/&amp;/gi, '&')
             .replace(/!\[[^\]]*]\([^)]*\)/g, ' ')
             .replace(/\[([^\]]*)]\([^)]*\)/g, '$1')
             .replace(/https?:\/\/\S+/g, ' ')
+            .replace(/<[^>]+>/g, ' ')
             .replace(/[`*_~#>]/g, '')
             .replace(/\s+/g, ' ')
             .trim()
             .toLowerCase();
     }
 
+    function joinParts(list, depth) {
+        let out = '';
+        for (let i = 0; i < list.length && i < 80; i++) {
+            const piece = textOf(list[i], depth + 1);
+            if (!piece) continue;
+            out += (out ? '\n' : '') + piece;
+        }
+        return out;
+    }
+
+    // Some entries store the visible digest as a JSON string. The card shows the
+    // inner text, so a raw "{...}" prefix would never match the bubble.
+    function jsonText(value, depth) {
+        if (typeof value !== 'string' || depth > 4) return '';
+        const trimmed = value.trim();
+        if (trimmed.length < 2 || trimmed.length > 2000000) return '';
+        const open = trimmed.charAt(0);
+        const close = trimmed.charAt(trimmed.length - 1);
+        if (!((open === '{' && close === '}') || (open === '[' && close === ']'))) return '';
+        try {
+            return textOf(nativeJSONParse(trimmed), depth + 1);
+        } catch (err) {
+            return '';
+        }
+    }
+
+    function preferLonger(current, next) {
+        if (!next) return current;
+        return next.length > current.length ? next : current;
+    }
+
     function textOf(value, depth) {
         if (value == null || depth > 6) return '';
-        if (typeof value === 'string') return value;
+        if (typeof value === 'string') {
+            const nested = jsonText(value, depth);
+            if (normalizeText(nested).length >= 2) return nested;
+            return value;
+        }
         if (typeof value === 'number' || typeof value === 'boolean') return '';
-        if (Array.isArray(value)) {
-            let out = '';
-            for (let i = 0; i < value.length && i < 80; i++) {
-                const piece = textOf(value[i], depth + 1);
-                if (!piece) continue;
-                out += (out ? '\n' : '') + piece;
+        if (Array.isArray(value)) return joinParts(value, depth);
+        if (typeof value !== 'object' || value.$$typeof) return '';
+
+        let best = '';
+        if (typeof value.content === 'string') {
+            const nested = jsonText(value.content, depth);
+            best = normalizeText(nested).length >= 2 ? nested : value.content;
+        } else if (value.content && typeof value.content === 'object' && value.content !== value) {
+            best = textOf(value.content, depth + 1);
+        }
+
+        if (value.message != null && typeof value.message === 'object' && value.message !== value) {
+            best = preferLonger(best, textOf(value.message, depth + 1));
+        }
+
+        const fields = ['plainText', 'plain_text', 'displayText', 'display_text', 'markdown', 'richText', 'rich_text', 'body', 'text'];
+        for (let i = 0; i < fields.length; i++) {
+            const field = value[fields[i]];
+            if (typeof field === 'string') {
+                const nested = jsonText(field, depth);
+                best = preferLonger(best, normalizeText(nested).length >= 2 ? nested : field);
+            } else if (field && typeof field === 'object' && field !== value) {
+                best = preferLonger(best, textOf(field, depth + 1));
             }
-            return out;
         }
-        if (typeof value !== 'object') return '';
-        if (typeof value.content === 'string') return value.content;
-        if (typeof value.text === 'string' && typeof value.type === 'string') return value.text;
-        if (value.message != null && value.message !== value) {
-            const nested = textOf(value.message, depth + 1);
-            if (nested) return nested;
+        if (Array.isArray(value.parts)) best = preferLonger(best, joinParts(value.parts, depth));
+        if (typeof value.title === 'string' && value.title.trim() && best.indexOf(value.title) === -1) {
+            best = value.title + (best ? '\n' : '') + best;
         }
-        if (typeof value.markdown === 'string') return value.markdown;
-        if (typeof value.body === 'string') return value.body;
-        if (typeof value.text === 'string') return value.text;
-        if (Array.isArray(value.content)) return textOf(value.content, depth + 1);
-        if (Array.isArray(value.parts)) return textOf(value.parts, depth + 1);
-        return '';
+        return best;
     }
 
     function readRole(obj) {
@@ -139,7 +191,8 @@
         if (role === 'assistant' || role === 'bot' || role === 'grok' || role === 'agent' || role === 'ai' || role === 'model') {
             return 'bot';
         }
-        if (kind === 'send-message' || kind === 'send_message') return 'bot';
+        if (kind === 'send-message' || kind === 'send_message' || kind === 'assistant-message' || kind === 'assistant_message' || kind === 'bot-message' || kind === 'bot_message') return 'bot';
+        if (kind === 'assistant' || kind === 'bot' || kind === 'grok' || kind === 'ai') return 'bot';
         return null;
     }
 
@@ -164,7 +217,21 @@
             const ms = toMs(obj[key]);
             if (ms) return ms;
         }
-        if (obj.time && typeof obj.time === 'object') return toMs(obj.time);
+        if (obj.time != null && obj.time !== obj) {
+            const ms = toMs(obj.time);
+            if (ms) return ms;
+        }
+        // Last resort for a field we have not named yet (ts, timeMs, postedAt).
+        // Skip edit/read/conversation clocks so a thread-level time is not reused.
+        const keys = Object.keys(obj);
+        for (let i = 0; i < keys.length && i < 40; i++) {
+            const key = keys[i];
+            if (key.length > 32) continue;
+            if (!/(time|date|stamp|^ts$|^ts[A-Z0-9]|At$)/.test(key)) continue;
+            if (/update|edit|modif|expire|expir|start|end|read|delet|seen|view|login|access|schedule|conversation|thread|parent|channel|account/i.test(key)) continue;
+            const ms = toMs(obj[key]);
+            if (ms) return ms;
+        }
         return null;
     }
 
@@ -187,71 +254,125 @@
 
     function upsertMessage(msg) {
         const prev = messageById.get(msg.id);
+        let changed = false;
         if (!prev) {
             messageById.set(msg.id, msg);
+            changed = true;
         } else {
-            if (msg.text.length >= prev.text.length) prev.text = msg.text;
-            if (msg.ms) prev.ms = msg.ms;
+            if (msg.text.length > prev.text.length) {
+                prev.text = msg.text;
+                changed = true;
+            }
+            if (msg.ms && msg.ms !== prev.ms) {
+                prev.ms = msg.ms;
+                changed = true;
+            }
         }
+        if (!changed) return;
         if (debugOn()) {
             console.info('[GrokMsgTime]', msg.id, new Date(msg.ms).toISOString(), msg.text.length);
         }
         schedule();
     }
 
-    function absorb(obj) {
-        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
-        if (classify(obj) !== 'bot') return;
-        const ms = readTime(obj);
-        if (!ms) return;
+    function absorb(obj, inheritedMs) {
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+        if (classify(obj) !== 'bot') return false;
+        const ms = readTime(obj) || inheritedMs || null;
+        if (!ms) return false;
         const text = textOf(obj, 0).replace(/\s+/g, ' ').trim();
-        if (normalizeText(text).length < 2) return;
-        const clipped = text.slice(0, 2000);
+        if (normalizeText(text).length < 2) return false;
+        const clipped = text.slice(0, 4000);
         const id = readId(obj) || ('auto:' + ms + ':' + hashText(normalizeText(clipped).slice(0, 180)));
         upsertMessage({ id: id, ms: ms, text: clipped });
+        return true;
+    }
+
+    function eachDirectChild(obj, fn) {
+        if (Array.isArray(obj)) {
+            for (let i = 0; i < obj.length && i < 4000; i++) fn(obj[i]);
+            return;
+        }
+        const keys = Object.keys(obj);
+        for (let i = 0; i < keys.length && i < 80; i++) {
+            const child = obj[keys[i]];
+            if (Array.isArray(child)) {
+                for (let j = 0; j < child.length && j < 4000; j++) fn(child[j]);
+            } else {
+                fn(child);
+            }
+        }
+    }
+
+    // A conversation createTime must not be copied onto every turn. A single
+    // envelope may lend its clock to the one bot entry nested under it.
+    function botChildCount(obj) {
+        let count = 0;
+        eachDirectChild(obj, function (child) {
+            if (child && typeof child === 'object' && !Array.isArray(child) && classify(child) === 'bot') count++;
+        });
+        return count;
+    }
+
+    function pushJsonChildren(obj, stack, depth, inheritedMs) {
+        const names = ['body', 'content', 'message', 'payload', 'data', 'entry'];
+        for (let i = 0; i < names.length; i++) {
+            const value = obj[names[i]];
+            if (typeof value !== 'string') continue;
+            const trimmed = value.trim();
+            if (trimmed.length < 2 || trimmed.length > 2000000) continue;
+            const open = trimmed.charAt(0);
+            if (open !== '{' && open !== '[') continue;
+            try {
+                const parsed = nativeJSONParse(trimmed);
+                if (parsed && typeof parsed === 'object') {
+                    stack.push({ value: parsed, depth: depth + 1, inheritedMs: inheritedMs });
+                }
+            } catch (err) {}
+        }
     }
 
     function harvest(value) {
-        const stack = [{ value: value, depth: 0 }];
+        const stack = [{ value: value, depth: 0, inheritedMs: null }];
         const seen = new WeakSet();
         let visited = 0;
         while (stack.length && visited < 15000) {
             const item = stack.pop();
             const current = item.value;
             if (!current || typeof current !== 'object') continue;
+            if (current.$$typeof || current.nodeType) continue;
             if (seen.has(current)) continue;
             seen.add(current);
             visited++;
-            if (!Array.isArray(current)) absorb(current);
-            if (item.depth >= 8) continue;
-            if (Array.isArray(current)) {
-                for (let i = 0; i < current.length && i < 4000; i++) {
-                    if (current[i] && typeof current[i] === 'object') {
-                        stack.push({ value: current[i], depth: item.depth + 1 });
-                    }
-                }
-            } else {
-                const keys = Object.keys(current);
-                const limit = Math.min(keys.length, 60);
-                for (let i = 0; i < limit; i++) {
-                    const child = current[keys[i]];
-                    if (child && typeof child === 'object') {
-                        stack.push({ value: child, depth: item.depth + 1 });
-                    }
-                }
+            let absorbed = false;
+            let ownMs = null;
+            if (!Array.isArray(current)) {
+                ownMs = readTime(current);
+                absorbed = absorb(current, ownMs || item.inheritedMs);
             }
+            if (item.depth >= 8) continue;
+            // An absorbed bubble already owns its clock. Two sibling bot turns
+            // never share one. Otherwise a one-entry envelope can lend its time.
+            const pass = botChildCount(current) >= 2 ? null : (absorbed ? null : (ownMs || item.inheritedMs));
+            if (!Array.isArray(current)) pushJsonChildren(current, stack, item.depth, pass);
+            eachDirectChild(current, function (child) {
+                if (child && typeof child === 'object') {
+                    stack.push({ value: child, depth: item.depth + 1, inheritedMs: pass });
+                }
+            });
         }
     }
 
     function hasTimeHint(text) {
-        return text.indexOf('timestampMs') !== -1 ||
-            text.indexOf('timestamp_ms') !== -1 ||
+        return text.indexOf('timestamp') !== -1 ||
             text.indexOf('createTime') !== -1 ||
             text.indexOf('createdAt') !== -1 ||
             text.indexOf('created_at') !== -1 ||
             text.indexOf('sentAt') !== -1 ||
             text.indexOf('sent_at') !== -1 ||
-            text.indexOf('createdAtMs') !== -1 ||
+            text.indexOf('sentTime') !== -1 ||
+            text.indexOf('sendTime') !== -1 ||
+            text.indexOf('postedAt') !== -1 ||
             text.indexOf('send-message') !== -1;
     }
 
@@ -484,32 +605,87 @@
         return new Date(ms).toISOString().replace('.000Z', 'Z') + ' · ' + zone;
     }
 
-    function buildKeys(list) {
-        const norms = [];
+    // Heads stay short on purpose. Growing the key to the full payload makes a
+    // card miss when a later paragraph differs by a link, a count, or a quote.
+    function buildHeads(list) {
         for (let i = 0; i < list.length; i++) {
             list[i].norm = normalizeText(list[i].text);
-            norms.push(list[i].norm);
         }
         for (let i = 0; i < list.length; i++) {
             const norm = list[i].norm;
-            let len = Math.min(32, norm.length);
-            let key = norm.slice(0, len);
-            while (len < norm.length) {
+            let len = Math.min(18, norm.length);
+            let head = norm.slice(0, len);
+            while (len < norm.length && len < 64) {
                 let count = 0;
-                for (let j = 0; j < norms.length; j++) {
-                    if (norms[j].indexOf(key) !== -1) count++;
+                for (let j = 0; j < list.length; j++) {
+                    if (list[j].norm.indexOf(head) !== -1) count++;
                 }
                 if (count <= 1) break;
-                len = Math.min(norm.length, len + 32);
-                key = norm.slice(0, len);
+                len = Math.min(64, norm.length, len + 16);
+                head = norm.slice(0, len);
+                if (len >= 64) break;
             }
-            list[i].key = key;
+            list[i].head = head;
         }
     }
 
-    function elementMatches(elNorm, msg) {
-        if (!msg.key || elNorm.indexOf(msg.key) === -1) return false;
+    function headCount(norm, list) {
+        const seen = Object.create(null);
+        let count = 0;
+        for (let i = 0; i < list.length; i++) {
+            const head = list[i].head;
+            if (!head || head.length < 2 || seen[head]) continue;
+            if (norm.indexOf(head) === -1) continue;
+            seen[head] = 1;
+            count++;
+        }
+        return count;
+    }
+
+    // A later digest can quote this card word for word. The message that reaches
+    // the card's opening first is the one the card is showing.
+    function ownerOfCardHead(cardHead, list) {
+        if (!cardHead || cardHead.length < 12) return null;
+        let owner = null;
+        let bestAt = Infinity;
+        let tied = false;
+        for (let i = 0; i < list.length; i++) {
+            if (!list[i].norm) continue;
+            const at = list[i].norm.indexOf(cardHead);
+            if (at === -1) continue;
+            if (at < bestAt) {
+                bestAt = at;
+                owner = list[i];
+                tied = false;
+            } else if (at === bestAt) {
+                tied = true;
+            }
+        }
+        if (!owner || tied) return null;
+        return owner;
+    }
+
+    function elementMatches(elNorm, msg, list) {
+        if (!elNorm || !msg || !msg.norm || !msg.head) return false;
+        const msgs = list || [msg];
+        const fullHead = msg.head.length === msg.norm.length;
+        const minHead = fullHead ? 2 : 8;
+        const hasHead = msg.head.length >= minHead && elNorm.indexOf(msg.head) !== -1;
+        const cardHead = elNorm.slice(0, Math.min(32, elNorm.length));
+        const ownsCard = ownerOfCardHead(cardHead, msgs) === msg;
+        if (!hasHead && !ownsCard) return false;
         if (msg.norm.length < 24 && elNorm.length > msg.norm.length * 6 + 80) return false;
+        // Several different openings means this node is a transcript shell.
+        // A card may still quote another digest; its own first line decides.
+        if (headCount(elNorm, msgs) > 1 && !ownsCard) return false;
+        // Long digests are stored clipped, so a real card can be longer than the
+        // payload. A transcript shell that only happens to start with this message
+        // is still rejected.
+        if (ownsCard) {
+            if (elNorm.length > msg.norm.length * 5 + 1500) return false;
+        } else if (elNorm.length > msg.norm.length * 2 + 600) {
+            return false;
+        }
         return true;
     }
 
@@ -533,7 +709,12 @@
     }
 
     function inComposer(el) {
-        return !!el.closest('textarea, [contenteditable="true"]');
+        if (el.closest('textarea, [contenteditable="true"]')) return true;
+        const editable = el.querySelector('textarea, [contenteditable="true"]');
+        if (!editable) return false;
+        const editableLen = (editable.value || editable.textContent || '').length;
+        const total = (el.textContent || '').length;
+        return total - editableLen < 40;
     }
 
     function isScrollBox(el) {
@@ -567,7 +748,7 @@
     function hitCount(norm, msgs) {
         let count = 0;
         for (let i = 0; i < msgs.length; i++) {
-            if (elementMatches(norm, msgs[i])) count++;
+            if (elementMatches(norm, msgs[i], msgs)) count++;
             if (count > 1) break;
         }
         return count;
@@ -582,7 +763,7 @@
             if (!MOUNT_TAGS.has(parent.tagName)) break;
             if (inSidebar(parent) || inChrome(parent)) break;
             const norm = normOf(parent);
-            if (!elementMatches(norm, msg) || hitCount(norm, msgs) !== 1) break;
+            if (!elementMatches(norm, msg, msgs) || hitCount(norm, msgs) !== 1) break;
             if (isHugeShell(parent, el)) break;
             if (isScrollBox(parent) && parent.scrollHeight > parent.clientHeight + 24) break;
             const composer = parent.querySelector('textarea, [contenteditable="true"]');
@@ -658,9 +839,9 @@
     }
 
     function paint(host, msg) {
-        if (!host || inSidebar(host) || inComposer(host)) return;
+        if (!host || inSidebar(host) || inComposer(host)) return false;
         const rect = host.getBoundingClientRect();
-        if (rect.width < Math.min(180, window.innerWidth * 0.45) || rect.height < 8) return;
+        if (rect.width < Math.min(180, window.innerWidth * 0.45) || rect.height < 8) return false;
         const point = insertionPoint(host);
         let badge = null;
         const existing = host.querySelectorAll('.grok-msg-time');
@@ -676,6 +857,43 @@
             point.insertBefore(badge, point.firstChild);
         }
         fillBadge(badge, msg);
+        return true;
+    }
+
+    // The gray card is often inside a transparent row. Put the chip on the card.
+    function preferBubble(host, msg, msgs) {
+        if (!host || looksLikeBubble(host)) return host;
+        const nodes = host.querySelectorAll('div, article, section, li, blockquote');
+        let best = null;
+        let bestScore = Infinity;
+        const limit = Math.min(nodes.length, 50);
+        for (let i = 0; i < limit; i++) {
+            const el = nodes[i];
+            if (el === host || !looksLikeBubble(el)) continue;
+            const norm = normOf(el);
+            if (!elementMatches(norm, msg, msgs)) continue;
+            const score = Math.abs(norm.length - msg.norm.length);
+            if (score < bestScore) {
+                best = el;
+                bestScore = score;
+            }
+        }
+        return best || host;
+    }
+
+    function hostChoices(start, msg, msgs) {
+        const list = [];
+        const seen = new Set();
+        function add(el) {
+            if (!el || seen.has(el)) return;
+            seen.add(el);
+            list.push(el);
+        }
+        const ascended = ascend(start, msg, msgs) || start;
+        add(preferBubble(ascended, msg, msgs));
+        add(ascended);
+        add(start);
+        return list;
     }
 
     function clearBadges() {
@@ -701,48 +919,133 @@
         return list;
     }
 
+    function propsLookRelevant(obj) {
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+        if (obj.timestampMs != null || obj.timestamp_ms != null || obj.createTime != null || obj.sentAt != null || obj.sentTime != null || obj.timestamp != null) return true;
+        const kind = typeof obj.kind === 'string' ? obj.kind.toLowerCase() : '';
+        if (kind === 'send-message' || kind === 'send_message' || kind === 'assistant-message' || kind === 'assistant_message' || kind === 'bot-message' || kind === 'bot_message' || kind === 'assistant' || kind === 'bot' || kind === 'grok') return true;
+        const role = obj.role || obj.sender;
+        if (role === 'assistant' || role === 'bot' || role === 'grok') return true;
+        if (obj.entry && typeof obj.entry === 'object') return true;
+        return false;
+    }
+
+    function fiberOf(el) {
+        if (!el) return null;
+        let keys;
+        try { keys = Object.keys(el); } catch (err) { return null; }
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            if (key.indexOf('__reactFiber$') === 0 || key.indexOf('__reactInternalInstance$') === 0) return el[key];
+            if (key.indexOf('__reactContainer$') === 0) {
+                const root = el[key];
+                return (root && (root.current || root)) || null;
+            }
+        }
+        return null;
+    }
+
+    function findFiberRoot() {
+        const named = [document.getElementById('__next'), document.getElementById('root'), document.body];
+        for (let i = 0; i < named.length; i++) {
+            const fiber = named[i] && fiberOf(named[i]);
+            if (fiber) return fiber;
+        }
+        const kids = document.body ? document.body.children : [];
+        for (let i = 0; i < kids.length && i < 12; i++) {
+            const fiber = fiberOf(kids[i]);
+            if (fiber) return fiber;
+        }
+        return null;
+    }
+
+    function considerFiberValue(value) {
+        if (!value || typeof value !== 'object') return;
+        if (Array.isArray(value)) {
+            if (!value.length || value.length > 1000 || !propsLookRelevant(value[0])) return;
+        } else if (!propsLookRelevant(value)) {
+            return;
+        }
+        try { harvest(value); } catch (err) {}
+    }
+
+    // The transcript can live in React memory after the response was parsed.
+    // Walk props only. Harvesting every props object would also walk the element tree.
+    function harvestFibers() {
+        const root = findFiberRoot();
+        if (!root) return;
+        const stack = [root];
+        const seen = new Set();
+        let steps = 0;
+        while (stack.length && steps < 5000) {
+            const fiber = stack.pop();
+            if (!fiber || typeof fiber !== 'object' || seen.has(fiber)) continue;
+            seen.add(fiber);
+            steps++;
+            try {
+                considerFiberValue(fiber.memoizedProps);
+                let hook = fiber.memoizedState;
+                let hooks = 0;
+                while (hook && hooks < 12) {
+                    considerFiberValue(hook.memoizedState);
+                    hook = hook.next;
+                    hooks++;
+                }
+            } catch (err) {}
+            if (fiber.child) stack.push(fiber.child);
+            if (fiber.sibling) stack.push(fiber.sibling);
+        }
+    }
+
     function render() {
         if (!isBotPage()) {
             clearBadges();
             return;
         }
+        try { harvestFibers(); } catch (err) {}
         const msgs = [];
         messageById.forEach(function (msg) { msgs.push(msg); });
         if (!msgs.length) return;
-        buildKeys(msgs);
+        buildHeads(msgs);
         const badges = document.querySelectorAll('.grok-msg-time');
         for (let i = 0; i < badges.length; i++) {
             const badge = badges[i];
             const msg = messageById.get(badge.dataset.gmtId || '');
             const host = badge.parentElement;
-            if (!msg || !host || !elementMatches(normOf(host), msg)) badge.remove();
+            if (!msg || !host || !elementMatches(normOf(host), msg, msgs)) badge.remove();
         }
         const candidates = collectCandidates();
         const used = new Set();
         const ordered = msgs.slice().sort(function (a, b) { return a.ms - b.ms; });
         for (let i = 0; i < ordered.length; i++) {
             const msg = ordered[i];
-            if (!msg.key) continue;
-            // Prefer the block whose text length is closest to the full message.
-            // A sidebar preview contains only the opening line and must lose to the card.
-            let tight = null;
-            let tightScore = Infinity;
+            if (!msg.head) continue;
+            const matches = [];
             for (let j = 0; j < candidates.length; j++) {
                 const candidate = candidates[j];
                 if (used.has(candidate.el)) continue;
-                if (!elementMatches(candidate.norm, msg)) continue;
-                const score = Math.abs(candidate.norm.length - msg.norm.length);
-                if (score < tightScore || (score === tightScore && candidate.len < tight.len)) {
-                    tight = candidate;
-                    tightScore = score;
-                }
+                if (!elementMatches(candidate.norm, msg, msgs)) continue;
+                let score = Math.abs(candidate.norm.length - msg.norm.length);
+                if (msg.head && candidate.norm.indexOf(msg.head) === 0) score -= 80;
+                matches.push({ candidate: candidate, score: score, index: j });
             }
-            if (!tight) continue;
-            const host = ascend(tight.el, msg, msgs) || tight.el;
-            if (used.has(host)) continue;
-            used.add(host);
-            used.add(tight.el);
-            paint(host, msg);
+            matches.sort(function (a, b) {
+                return a.score - b.score || a.index - b.index;
+            });
+            let painted = false;
+            for (let k = 0; k < matches.length && k < 6; k++) {
+                const el = matches[k].candidate.el;
+                const hosts = hostChoices(el, msg, msgs);
+                for (let h = 0; h < hosts.length; h++) {
+                    if (!paint(hosts[h], msg)) continue;
+                    used.add(hosts[h]);
+                    used.add(el);
+                    painted = true;
+                    break;
+                }
+                if (painted) break;
+            }
+            if (!painted && debugOn()) console.info('[GrokMsgTime] unmatched', msg.id);
         }
     }
 
@@ -880,7 +1183,9 @@
             messages: messageById,
             formatAbsolute: formatAbsolute,
             formatRelative: formatRelative,
-            absorb: absorb
+            absorb: absorb,
+            buildHeads: buildHeads,
+            elementMatches: elementMatches
         };
     } else if (typeof document !== 'undefined') {
         boot();
