@@ -2,9 +2,9 @@
 // @name         Grok Bot New Message Voice
 // @name:zh-CN   Grok Bot 新消息语音播报
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.0
-// @description  Speak "<Bot> 机器人有新的消息请查收" when any Grok Bot gets a new message. Reads the bot channel the grok.com page already has open, and the unread dots in the sidebar Bots list.
-// @description:zh-CN 任意 Grok Bot 收到新消息时，用浏览器语音朗读「[Bot名称] 机器人有新的消息请查收」。数据来自页面自己的 Bot WebSocket 和左侧「机器人」列表的未读蓝点，折叠在「展开」里的 Bot 也能听到。页面没点过之前浏览器不让出声，脚本会先排队提示，点一下页面就补播。
+// @version      1.1.0
+// @description  Speak "<Bot> 机器人有新的消息请查收" when any Grok Bot gets a new message. Asks grok.com's bot channel for the bot list every 30 seconds, and also reads the unread dots in the sidebar Bots list.
+// @description:zh-CN 任意 Grok Bot 收到新消息时，用浏览器语音朗读「[Bot名称] 机器人有新的消息请查收」。脚本每 30 秒通过 Grok 的 Bot 通道查询一次全部 Bot 的未读状态（页面自己不会实时刷新），也看左侧「机器人」列表的未读蓝点，折叠在「展开」里的 Bot 也能听到。页面没点过之前浏览器不让出声，脚本会先排队，并在标签页图标上显示数字角标，点一下页面就补播。
 // @author       Anna-SAP
 // @match        https://grok.com/*
 // @match        https://www.grok.com/*
@@ -36,7 +36,8 @@
         toast: true,
         notify: false,
         entrySelector: '',
-        dotSelector: ''
+        dotSelector: '',
+        pollSec: 30
     };
     // Unread state seen in the first seconds after load is the backlog, not news.
     const WARMUP_MS = 6000;
@@ -66,6 +67,9 @@
     let titleBadge = '';
     let scanTimer = 0;
     let socketSeen = false;
+    let SocketCtor = null;
+    const poll = { ws: null, ready: false, timer: 0, lastAsk: 0, lastReply: 0, retry: 0, seq: 0 };
+    let iconLink = null;
     const warned = new Set();
 
     function readJson(key, fallback) {
@@ -200,8 +204,9 @@
     // ---------- channel 1: the bot WebSocket ----------
     // grok.com talks JSON-RPC over wss://grok.com/ws/bot/. bot.command(listAgents)
     // returns every bot with hasUnread and lastMessageId, including the ones the
-    // sidebar keeps folded behind 展开. Later frames that carry the same fields
-    // are read the same way, whatever their method name.
+    // sidebar keeps folded behind 展开. The page only asks for it when its socket
+    // connects, and the server does not push a new unread to an open page, so
+    // the poller below asks again on a connection of its own.
     function readAgent(obj) {
         const id = typeof obj.agentId === 'string' ? obj.agentId : (typeof obj.id === 'string' ? obj.id : '');
         if (!id || !AGENT_ID.test(id)) return null;
@@ -293,6 +298,7 @@
 
     function hookSockets() {
         const Native = window.WebSocket;
+        SocketCtor = Native || null;
         if (!Native || Native.__gbv) return;
         function WrappedWebSocket(url, protocols) {
             const ws = protocols === undefined ? new Native(url) : new Native(url, protocols);
@@ -312,6 +318,89 @@
         } catch (err) {
             warnOnce('无法挂接 WebSocket，只能靠侧栏蓝点判断');
         }
+    }
+
+    function pollMs() {
+        const sec = Number(config.pollSec);
+        return Number.isFinite(sec) && sec > 0 ? Math.max(15, sec) * 1000 : 0;
+    }
+
+    function askList() {
+        const ws = poll.ws;
+        if (!ws || ws.readyState !== 1 || !poll.ready) return;
+        poll.lastAsk = Date.now();
+        poll.seq++;
+        try {
+            ws.send(JSON.stringify({ jsonrpc: '2.0', id: 'gbv-' + poll.seq, method: 'bot.command', params: { agentId: '', name: 'listAgents', args: {} } }));
+        } catch (err) {}
+    }
+
+    function schedulePoll() {
+        clearTimeout(poll.timer);
+        const ms = pollMs();
+        if (!ms) return;
+        poll.timer = setTimeout(function () {
+            askList();
+            schedulePoll();
+        }, ms);
+    }
+
+    function openPoller() {
+        if (!pollMs() || poll.ws || !SocketCtor || window.top !== window.self) return;
+        let ws;
+        try {
+            ws = new SocketCtor(location.origin.replace(/^http/, 'ws') + '/ws/bot/');
+        } catch (err) {
+            warnOnce('无法建立 Bot 轮询连接，只能等页面自己刷新');
+            return;
+        }
+        poll.ws = ws;
+        poll.ready = false;
+        ws.addEventListener('open', function () {
+            ws.send(JSON.stringify({ protocol_version: '1.0.0', kind: 'bot_client', capabilities: [] }));
+        });
+        ws.addEventListener('message', function (event) {
+            const data = event.data;
+            if (typeof data !== 'string') return;
+            if (data.length < 200 && data.indexOf('"ping"') !== -1) {
+                let ping = null;
+                try { ping = nativeParse(data); } catch (err) {}
+                if (ping && ping.method === 'ping') {
+                    ws.send(JSON.stringify({ method: 'pong', ts_ms: ping.ts_ms }));
+                    // Server pings keep coming in a background tab; timers get throttled there.
+                    if (Date.now() - poll.lastAsk >= pollMs()) askList();
+                    return;
+                }
+            }
+            if (!poll.ready && data.indexOf('connection_id') !== -1) {
+                poll.ready = true;
+                poll.retry = 0;
+                askList();
+                schedulePoll();
+                return;
+            }
+            if (data.indexOf('"gbv-') !== -1) poll.lastReply = Date.now();
+            onSocketFrame(event);
+        });
+        ws.addEventListener('close', function () {
+            if (poll.ws !== ws) return;
+            poll.ws = null;
+            poll.ready = false;
+            clearTimeout(poll.timer);
+            if (!pollMs()) return;
+            setTimeout(openPoller, Math.min(300000, 5000 * Math.pow(2, poll.retry++)));
+        });
+    }
+
+    function restartPoller() {
+        const ws = poll.ws;
+        poll.ws = null;
+        poll.ready = false;
+        clearTimeout(poll.timer);
+        if (ws) {
+            try { ws.close(1000, 'restart'); } catch (err) {}
+        }
+        openPoller();
     }
 
     function onRoute() {
@@ -641,14 +730,15 @@
                     dirty = true;
                 }
                 bot.seenUnread = true;
-            } else if (dom.level > 0 || bot.net.unread) {
+            } else if (dom.level > 0) {
                 if (!dom.readSince) {
                     dom.readSince = now;
                     later(READ_GRACE_MS + 120);
                 } else if (now - dom.readSince >= READ_GRACE_MS) {
                     dom.level = 0;
                     dom.readSince = 0;
-                    // The row has no dot, so whatever the socket last said is stale.
+                    // The dot went away, so the bot was read. A row that never
+                    // showed the dot says nothing: the sidebar lags the poll.
                     if (bot.net.unread) bot.net.unread = false;
                     dirty = true;
                 }
@@ -980,6 +1070,52 @@
         titleBadge = badge;
         const next = badge + base;
         if (next !== document.title) document.title = next;
+        updateFavicon(pending);
+    }
+
+    // A pinned tab shows no title, so put the waiting count on the tab icon.
+    function updateFavicon(pending) {
+        const head = document.head;
+        if (!head) return;
+        if (!pending) {
+            if (!iconLink) return;
+            iconLink.remove();
+            iconLink = null;
+            head.querySelectorAll('link[data-gbv-rel]').forEach(function (link) {
+                link.rel = link.getAttribute('data-gbv-rel');
+                link.removeAttribute('data-gbv-rel');
+            });
+            return;
+        }
+        const label = pending > 9 ? '9+' : String(pending);
+        if (iconLink && iconLink.getAttribute('data-count') === label && iconLink.isConnected) return;
+        const canvas = document.createElement('canvas');
+        canvas.width = 64;
+        canvas.height = 64;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.fillStyle = '#ea580c';
+        ctx.beginPath();
+        ctx.arc(32, 32, 31, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold ' + (label.length > 1 ? 34 : 44) + 'px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, 32, 35);
+        head.querySelectorAll('link[rel~="icon"]').forEach(function (link) {
+            if (link === iconLink) return;
+            link.setAttribute('data-gbv-rel', link.rel);
+            link.rel = 'gbv-icon-off';
+        });
+        if (!iconLink) {
+            iconLink = document.createElement('link');
+            iconLink.rel = 'icon';
+            iconLink.type = 'image/png';
+        }
+        iconLink.setAttribute('data-count', label);
+        iconLink.href = canvas.toDataURL('image/png');
+        if (!iconLink.isConnected) head.appendChild(iconLink);
     }
 
     function toast(text, id) {
@@ -1080,7 +1216,16 @@
                     });
                 });
                 console.table(rows);
-                return { 语音: speech.state, 接口通道: socketSeen ? '已收到数据' : '还没收到数据', 待播报: pendingItems().map(function (item) { return item.text; }), bots: rows };
+                const pollState = !pollMs()
+                    ? '已关闭'
+                    : (poll.ready ? '已连接，上次回复 ' + (poll.lastReply ? Math.round((Date.now() - poll.lastReply) / 1000) + ' 秒前' : '还没有') : '连接中');
+                return {
+                    语音: speech.state,
+                    接口通道: socketSeen ? '已收到数据' : '还没收到数据',
+                    轮询: pollState,
+                    待播报: pendingItems().map(function (item) { return item.text; }),
+                    bots: rows
+                };
             },
             // What the sidebar shows right now, and which element counts as the dot.
             scan: function () {
@@ -1155,8 +1300,10 @@
                     else stored[key] = patch[key];
                 });
                 writeJson(KEY_CONFIG, stored);
+                const pollWas = pollMs();
                 config = loadConfig();
                 speech.voiceKey = '';
+                if (pollMs() !== pollWas) restartPoller();
                 if (patch.notify === true && typeof Notification !== 'undefined' && Notification.permission === 'default') {
                     Notification.requestPermission();
                 }
@@ -1181,7 +1328,7 @@
             }
         };
         if (window.__GBV_TEST__) {
-            window.__GBV = { bots: bots, netObserve: netObserve, agentRecords: agentRecords, onSocketFrame: onSocketFrame, domMark: domMark, scan: scan, speech: speech };
+            window.__GBV = { bots: bots, netObserve: netObserve, agentRecords: agentRecords, onSocketFrame: onSocketFrame, domMark: domMark, scan: scan, speech: speech, poll: poll };
         }
     }
 
@@ -1229,6 +1376,7 @@
             observe();
             probe();
             queueScan(0);
+            openPoller();
         };
         if (document.body) start();
         else document.addEventListener('DOMContentLoaded', start, { once: true });
