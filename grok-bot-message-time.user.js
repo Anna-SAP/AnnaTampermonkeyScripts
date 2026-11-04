@@ -732,7 +732,7 @@
         }
         let facts = factsByNorm.get(elNorm);
         if (!facts) {
-            facts = { owner: undefined, heads: -1 };
+            facts = { owner: undefined, heads: -1, matches: null };
             factsByNorm.set(elNorm, facts);
         }
         return facts;
@@ -773,6 +773,18 @@
             return false;
         }
         return true;
+    }
+
+    function cardMatches(elNorm, list) {
+        const facts = cardFacts(elNorm, list);
+        if (!facts.matches) {
+            const found = [];
+            for (let i = 0; i < list.length; i++) {
+                if (elementMatches(elNorm, list[i], list)) found.push(list[i]);
+            }
+            facts.matches = found;
+        }
+        return facts.matches;
     }
 
     const normCache = new WeakMap();
@@ -1146,15 +1158,26 @@
             yield;
         }
         const candidates = yield* candidateSteps();
+        const cardsOf = new Map();
+        for (let j = 0; j < candidates.length; j++) {
+            const found = cardMatches(candidates[j].norm, msgs);
+            for (let k = 0; k < found.length; k++) {
+                if (stamped.has(found[k].id)) continue;
+                if (!cardsOf.has(found[k])) cardsOf.set(found[k], []);
+                cardsOf.get(found[k]).push(j);
+            }
+            yield;
+        }
         const ordered = msgs.slice().sort(function (a, b) { return a.ms - b.ms; });
         for (let i = 0; i < ordered.length; i++) {
             const msg = ordered[i];
             if (!msg.head || stamped.has(msg.id)) continue;
+            const cards = cardsOf.get(msg) || [];
             const matches = [];
-            for (let j = 0; j < candidates.length; j++) {
+            for (let c = 0; c < cards.length; c++) {
+                const j = cards[c];
                 const candidate = candidates[j];
                 if (used.has(candidate.el)) continue;
-                if (!elementMatches(candidate.norm, msg, msgs)) continue;
                 let score = Math.abs(candidate.norm.length - msg.norm.length);
                 if (msg.head && candidate.norm.indexOf(msg.head) === 0) score -= 80;
                 matches.push({ candidate: candidate, score: score, index: j });
