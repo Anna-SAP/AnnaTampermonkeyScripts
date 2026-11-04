@@ -2,7 +2,7 @@
 // @name         Grok Bot Message Time
 // @name:zh-CN   Grok Bot 消息精确时间
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.1.0
+// @version      1.1.1
 // @description  Show the exact send time on each Grok Bot message. The grok.com/bot transcript hides precise timestamps; this reads them from the page's own loaded transcript and paints a clock on the message card.
 // @description:zh-CN 在 grok.com/bot 的每条 Bot 消息上显示精确发送时间。页面只给出「周一早上」「傍晚」这类说法，脚本从页面已经加载的会话数据里取出时间戳，标在对应消息块顶部。
 // @author       Anna-SAP
@@ -34,9 +34,21 @@
     const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
     const CLOCK_SVG = '<svg class="gmt-clock" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.6"></circle><path d="M8 4.6V8.1l2.35 1.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
 
+    // The composer shares the main thread with every stamp. Work runs in short
+    // idle slices, only after something changed, and never while the user types.
+    const SLICE_MS = 5;
+    const QUIET_MS = 900;
+    const DOM_DELAY_MS = 160;
+    const SWEEP_MS = 10000;
+    const MAX_MESSAGES = 1200;
+    const MAX_QUEUE = 400;
+    // Mutations in these areas cannot change a transcript card.
+    const QUIET_ZONES = '.grok-msg-time, textarea, [contenteditable="true"], .query-bar, [data-sidebar], nav, aside, header, [role="navigation"], [role="banner"]';
+
     const messageById = new Map();
     const seenPayloads = new Set();
     const seenPaths = [];
+    const ingestQueue = [];
 
     function acceptMs(ms) {
         if (!Number.isFinite(ms)) return null;
@@ -269,6 +281,7 @@
             }
         }
         if (!changed) return;
+        msgGen++;
         if (debugOn()) {
             console.info('[GrokMsgTime]', msg.id, new Date(msg.ms).toISOString(), msg.text.length);
         }
@@ -332,7 +345,7 @@
         }
     }
 
-    function harvest(value) {
+    function* harvestSteps(value) {
         const stack = [{ value: value, depth: 0, inheritedMs: null }];
         const seen = new WeakSet();
         let visited = 0;
@@ -344,6 +357,7 @@
             if (seen.has(current)) continue;
             seen.add(current);
             visited++;
+            if ((visited & 255) === 0) yield;
             let absorbed = false;
             let ownMs = null;
             if (!Array.isArray(current)) {
@@ -360,6 +374,34 @@
                     stack.push({ value: child, depth: item.depth + 1, inheritedMs: pass });
                 }
             });
+        }
+    }
+
+    function drain(steps) {
+        while (!steps.next().done) {}
+    }
+
+    function harvest(value) {
+        drain(harvestSteps(value));
+    }
+
+    // Hooks run inside the page's own parse and socket calls, so they only queue.
+    function enqueue(item) {
+        ingestQueue.push(item);
+        if (ingestQueue.length > MAX_QUEUE) ingestQueue.shift();
+        schedule();
+    }
+
+    function* drainQueue() {
+        while (ingestQueue.length) {
+            const item = ingestQueue[0];
+            try {
+                yield* harvestSteps(typeof item === 'string' ? nativeJSONParse(item) : item);
+            } catch (err) {
+                // Not a single JSON value (SSE frames are handled separately).
+            }
+            if (ingestQueue[0] === item) ingestQueue.shift();
+            yield;
         }
     }
 
@@ -399,11 +441,7 @@
     function ingestText(text) {
         if (typeof text !== 'string' || text.length < 30 || text.length > 12000000) return;
         if (!hasTimeHint(text) || rememberPayload(text)) return;
-        try {
-            harvest(nativeJSONParse(text));
-        } catch (err) {
-            // Not a single JSON value (SSE frames are handled separately).
-        }
+        enqueue(text);
     }
 
     function ingestLine(line) {
@@ -422,7 +460,7 @@
         const wrappedParse = function (text, reviver) {
             const value = reviver === undefined ? nativeJSONParse(text) : nativeJSONParse(text, reviver);
             if (typeof text === 'string' && text.length >= 30 && text.length <= 12000000 && hasTimeHint(text) && !rememberPayload(text)) {
-                try { harvest(value); } catch (err) {}
+                enqueue(value);
             }
             return value;
         };
@@ -436,7 +474,7 @@
             const nativeJson = page.Response.prototype.json;
             page.Response.prototype.json = function () {
                 return nativeJson.call(this).then(function (value) {
-                    try { harvest(value); } catch (err) {}
+                    enqueue(value);
                     return value;
                 });
             };
@@ -474,7 +512,7 @@
                     try {
                         notePath(this.__gmtUrl || '');
                         if (this.responseType === 'json' && this.response) {
-                            harvest(this.response);
+                            enqueue(this.response);
                             return;
                         }
                         if (this.responseType && this.responseType !== 'text') return;
@@ -597,20 +635,31 @@
             WEEKDAYS[date.getDay()] + ' ' + hh + ':' + mm + ':' + ss;
     }
 
+    let zoneName = '';
+
     function hoverText(ms) {
-        let zone = 'local';
-        try {
-            zone = Intl.DateTimeFormat().resolvedOptions().timeZone || zone;
-        } catch (err) {}
-        return new Date(ms).toISOString().replace('.000Z', 'Z') + ' · ' + zone;
+        if (!zoneName) {
+            try {
+                zoneName = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+            } catch (err) {
+                zoneName = 'local';
+            }
+        }
+        return new Date(ms).toISOString().replace('.000Z', 'Z') + ' · ' + zoneName;
+    }
+
+    // True when the message's head can no longer be trusted.
+    function refreshNorm(msg) {
+        if (msg.normFrom === msg.text) return false;
+        msg.norm = normalizeText(msg.text);
+        msg.normFrom = msg.text;
+        return !msg.head || msg.head.length < 18 || msg.norm.indexOf(msg.head) !== 0;
     }
 
     // Heads stay short on purpose. Growing the key to the full payload makes a
     // card miss when a later paragraph differs by a link, a count, or a quote.
-    function buildHeads(list) {
-        for (let i = 0; i < list.length; i++) {
-            list[i].norm = normalizeText(list[i].text);
-        }
+    function* headSteps(list) {
+        for (let i = 0; i < list.length; i++) refreshNorm(list[i]);
         for (let i = 0; i < list.length; i++) {
             const norm = list[i].norm;
             let len = Math.min(18, norm.length);
@@ -626,7 +675,12 @@
                 if (len >= 64) break;
             }
             list[i].head = head;
+            yield;
         }
+    }
+
+    function buildHeads(list) {
+        drain(headSteps(list));
     }
 
     function headCount(norm, list) {
@@ -665,19 +719,51 @@
         return owner;
     }
 
+    // Both answers scan the whole message list, and a pass needs them for every
+    // candidate against every message. Asking once per card text per list is
+    // what keeps a pass linear: repeating them cost 1.4M indexOf calls per render.
+    let factsList = null;
+    let factsByNorm = new Map();
+
+    function cardFacts(elNorm, list) {
+        if (factsList !== list || factsByNorm.size > 20000) {
+            factsList = list;
+            factsByNorm = new Map();
+        }
+        let facts = factsByNorm.get(elNorm);
+        if (!facts) {
+            facts = { owner: undefined, heads: -1, matches: null };
+            factsByNorm.set(elNorm, facts);
+        }
+        return facts;
+    }
+
+    function cardOwner(elNorm, list) {
+        const facts = cardFacts(elNorm, list);
+        if (facts.owner === undefined) {
+            facts.owner = ownerOfCardHead(elNorm.slice(0, Math.min(32, elNorm.length)), list);
+        }
+        return facts.owner;
+    }
+
+    function cardHeads(elNorm, list) {
+        const facts = cardFacts(elNorm, list);
+        if (facts.heads < 0) facts.heads = headCount(elNorm, list);
+        return facts.heads;
+    }
+
     function elementMatches(elNorm, msg, list) {
         if (!elNorm || !msg || !msg.norm || !msg.head) return false;
         const msgs = list || [msg];
         const fullHead = msg.head.length === msg.norm.length;
         const minHead = fullHead ? 2 : 8;
         const hasHead = msg.head.length >= minHead && elNorm.indexOf(msg.head) !== -1;
-        const cardHead = elNorm.slice(0, Math.min(32, elNorm.length));
-        const ownsCard = ownerOfCardHead(cardHead, msgs) === msg;
+        const ownsCard = cardOwner(elNorm, msgs) === msg;
         if (!hasHead && !ownsCard) return false;
         if (msg.norm.length < 24 && elNorm.length > msg.norm.length * 6 + 80) return false;
         // Several different openings means this node is a transcript shell.
         // A card may still quote another digest; its own first line decides.
-        if (headCount(elNorm, msgs) > 1 && !ownsCard) return false;
+        if (cardHeads(elNorm, msgs) > 1 && !ownsCard) return false;
         // Long digests are stored clipped, so a real card can be longer than the
         // payload. A transcript shell that only happens to start with this message
         // is still rejected.
@@ -689,12 +775,31 @@
         return true;
     }
 
-    function normOf(el) {
-        if (!el.querySelector('.grok-msg-time')) return normalizeText(el.textContent || '');
-        const clone = el.cloneNode(true);
-        const badges = clone.querySelectorAll('.grok-msg-time');
-        for (let i = 0; i < badges.length; i++) badges[i].remove();
-        return normalizeText(clone.textContent || '');
+    function cardMatches(elNorm, list) {
+        const facts = cardFacts(elNorm, list);
+        if (!facts.matches) {
+            const found = [];
+            for (let i = 0; i < list.length; i++) {
+                if (elementMatches(elNorm, list[i], list)) found.push(list[i]);
+            }
+            facts.matches = found;
+        }
+        return facts.matches;
+    }
+
+    const normCache = new WeakMap();
+
+    // The card's text without our own chips. The chip text is cut from the string
+    // so that reading a card does not deep-clone it.
+    function normOf(el, known) {
+        let raw = known == null ? (el.textContent || '') : known;
+        const badges = el.querySelectorAll('.grok-msg-time');
+        for (let i = 0; i < badges.length; i++) raw = raw.replace(badges[i].textContent, '');
+        const hit = normCache.get(el);
+        if (hit && hit.raw === raw) return hit.norm;
+        const norm = normalizeText(raw);
+        normCache.set(el, { raw: raw, norm: norm });
+        return norm;
     }
 
     function inChrome(el) {
@@ -823,9 +928,9 @@
         const dark = isDarkSurface(el.parentElement || el);
         el.classList.toggle('is-dark', dark);
         const signature = msg.ms + '|' + relative + '|' + (dark ? 'd' : 'l');
+        if (el.dataset.sig === signature) return;
         el.dateTime = new Date(msg.ms).toISOString();
         el.title = hoverText(msg.ms);
-        if (el.dataset.sig === signature) return;
         el.dataset.sig = signature;
         el.dataset.ms = String(msg.ms);
         el.dataset.gmtId = msg.id;
@@ -839,9 +944,9 @@
     }
 
     function paint(host, msg) {
-        if (!host || inSidebar(host) || inComposer(host)) return false;
+        if (!host || inSidebar(host) || inComposer(host)) return null;
         const rect = host.getBoundingClientRect();
-        if (rect.width < Math.min(180, window.innerWidth * 0.45) || rect.height < 8) return false;
+        if (rect.width < Math.min(180, window.innerWidth * 0.45) || rect.height < 8) return null;
         const point = insertionPoint(host);
         let badge = null;
         const existing = host.querySelectorAll('.grok-msg-time');
@@ -857,7 +962,7 @@
             point.insertBefore(badge, point.firstChild);
         }
         fillBadge(badge, msg);
-        return true;
+        return badge;
     }
 
     // The gray card is often inside a transparent row. Put the chip on the card.
@@ -901,20 +1006,21 @@
         for (let i = 0; i < badges.length; i++) badges[i].remove();
     }
 
-    function collectCandidates() {
+    function* candidateSteps() {
         const main = document.querySelector('main, [role="main"]');
         const root = main && main.querySelectorAll('div').length > 4 ? main : document.body;
         if (!root) return [];
         const nodes = root.querySelectorAll('div, article, section, li, blockquote');
         const list = [];
         for (let i = 0; i < nodes.length; i++) {
+            if ((i & 31) === 31) yield;
             const el = nodes[i];
             if (el.classList.contains('grok-msg-time') || el.closest('.grok-msg-time')) continue;
             if (inChrome(el) || inSidebar(el) || inComposer(el)) continue;
             const raw = el.textContent || '';
             if (raw.length < 2 || raw.length > 60000) continue;
             if (el.getClientRects().length === 0) continue;
-            list.push({ el: el, norm: normOf(el), len: raw.length });
+            list.push({ el: el, norm: normOf(el, raw), len: raw.length });
         }
         return list;
     }
@@ -959,19 +1065,17 @@
         return null;
     }
 
-    function considerFiberValue(value) {
-        if (!value || typeof value !== 'object') return;
+    function worthHarvesting(value) {
+        if (!value || typeof value !== 'object') return false;
         if (Array.isArray(value)) {
-            if (!value.length || value.length > 1000 || !propsLookRelevant(value[0])) return;
-        } else if (!propsLookRelevant(value)) {
-            return;
+            return value.length > 0 && value.length <= 1000 && propsLookRelevant(value[0]);
         }
-        try { harvest(value); } catch (err) {}
+        return propsLookRelevant(value);
     }
 
     // The transcript can live in React memory after the response was parsed.
     // Walk props only. Harvesting every props object would also walk the element tree.
-    function harvestFibers() {
+    function* fiberSteps() {
         const root = findFiberRoot();
         if (!root) return;
         const stack = [root];
@@ -982,12 +1086,13 @@
             if (!fiber || typeof fiber !== 'object' || seen.has(fiber)) continue;
             seen.add(fiber);
             steps++;
+            if ((steps & 63) === 0) yield;
             try {
-                considerFiberValue(fiber.memoizedProps);
+                if (worthHarvesting(fiber.memoizedProps)) yield* harvestSteps(fiber.memoizedProps);
                 let hook = fiber.memoizedState;
                 let hooks = 0;
                 while (hook && hooks < 12) {
-                    considerFiberValue(hook.memoizedState);
+                    if (worthHarvesting(hook.memoizedState)) yield* harvestSteps(hook.memoizedState);
                     hook = hook.next;
                     hooks++;
                 }
@@ -997,34 +1102,82 @@
         }
     }
 
-    function render() {
-        if (!isBotPage()) {
-            clearBadges();
-            return;
+    function trimMessages() {
+        let over = messageById.size - MAX_MESSAGES;
+        if (over <= 0) return;
+        const ids = messageById.keys();
+        while (over-- > 0) messageById.delete(ids.next().value);
+    }
+
+    // One array per message state: cardFacts stays valid for as long as it is.
+    let liveList = [];
+    let liveListGen = 0;
+    let headsStale = false;
+
+    function* messageSteps(mark) {
+        if (liveListGen === mark) return liveList;
+        trimMessages();
+        const list = Array.from(messageById.values());
+        for (let i = 0; i < list.length; i++) {
+            if (refreshNorm(list[i])) headsStale = true;
+            if ((i & 31) === 31) yield;
         }
-        try { harvestFibers(); } catch (err) {}
-        const msgs = [];
-        messageById.forEach(function (msg) { msgs.push(msg); });
-        if (!msgs.length) return;
-        buildHeads(msgs);
+        if (headsStale) {
+            yield* headSteps(list);
+            headsStale = false;
+        }
+        liveList = list;
+        liveListGen = mark;
+        return list;
+    }
+
+    const claims = new WeakMap();
+
+    function* stampSteps(msgs) {
+        const debug = debugOn();
+        const stamped = new Set();
+        const used = new Set();
         const badges = document.querySelectorAll('.grok-msg-time');
         for (let i = 0; i < badges.length; i++) {
             const badge = badges[i];
             const msg = messageById.get(badge.dataset.gmtId || '');
             const host = badge.parentElement;
-            if (!msg || !host || !elementMatches(normOf(host), msg, msgs)) badge.remove();
+            if (!msg || !host || !elementMatches(normOf(host), msg, msgs)) {
+                badge.remove();
+                continue;
+            }
+            // A chip that still fits its card is done. Only its label can age.
+            stamped.add(msg.id);
+            used.add(host);
+            const claim = claims.get(badge);
+            if (claim) {
+                used.add(claim.host);
+                used.add(claim.el);
+            }
+            fillBadge(badge, msg);
+            yield;
         }
-        const candidates = collectCandidates();
-        const used = new Set();
+        const candidates = yield* candidateSteps();
+        const cardsOf = new Map();
+        for (let j = 0; j < candidates.length; j++) {
+            const found = cardMatches(candidates[j].norm, msgs);
+            for (let k = 0; k < found.length; k++) {
+                if (stamped.has(found[k].id)) continue;
+                if (!cardsOf.has(found[k])) cardsOf.set(found[k], []);
+                cardsOf.get(found[k]).push(j);
+            }
+            yield;
+        }
         const ordered = msgs.slice().sort(function (a, b) { return a.ms - b.ms; });
         for (let i = 0; i < ordered.length; i++) {
             const msg = ordered[i];
-            if (!msg.head) continue;
+            if (!msg.head || stamped.has(msg.id)) continue;
+            const cards = cardsOf.get(msg) || [];
             const matches = [];
-            for (let j = 0; j < candidates.length; j++) {
+            for (let c = 0; c < cards.length; c++) {
+                const j = cards[c];
                 const candidate = candidates[j];
                 if (used.has(candidate.el)) continue;
-                if (!elementMatches(candidate.norm, msg, msgs)) continue;
                 let score = Math.abs(candidate.norm.length - msg.norm.length);
                 if (msg.head && candidate.norm.indexOf(msg.head) === 0) score -= 80;
                 matches.push({ candidate: candidate, score: score, index: j });
@@ -1037,7 +1190,9 @@
                 const el = matches[k].candidate.el;
                 const hosts = hostChoices(el, msg, msgs);
                 for (let h = 0; h < hosts.length; h++) {
-                    if (!paint(hosts[h], msg)) continue;
+                    const badge = paint(hosts[h], msg);
+                    if (!badge) continue;
+                    claims.set(badge, { host: hosts[h], el: el });
                     used.add(hosts[h]);
                     used.add(el);
                     painted = true;
@@ -1045,21 +1200,143 @@
                 }
                 if (painted) break;
             }
-            if (!painted && debugOn()) console.info('[GrokMsgTime] unmatched', msg.id);
+            if (!painted && debug) console.info('[GrokMsgTime] unmatched', msg.id);
+            yield;
         }
     }
 
-    let renderTimer = 0;
+    // domGen and msgGen count changes; a finished pass records what it covered.
+    // Nothing new since then means there is nothing to do.
+    let domGen = 1;
+    let seenDomGen = 0;
+    let msgGen = 0;
+    let seenMsgGen = 0;
+
+    function* passSteps() {
+        const domMark = domGen;
+        yield* drainQueue();
+        if (!isBotPage()) {
+            clearBadges();
+            seenDomGen = domMark;
+            seenMsgGen = msgGen;
+            return;
+        }
+        const domChanged = seenDomGen !== domMark;
+        // Fibers only follow the DOM, so a message update cannot re-trigger itself.
+        if (domChanged) yield* fiberSteps();
+        const msgMark = msgGen;
+        if (domChanged || seenMsgGen !== msgMark) {
+            const msgs = yield* messageSteps(msgMark);
+            if (msgs.length) yield* stampSteps(msgs);
+        }
+        seenDomGen = domMark;
+        seenMsgGen = msgMark;
+    }
+
+    function render() {
+        domGen++;
+        job = null;
+        drain(passSteps());
+    }
+
+    let job = null;
+    let wakeTimer = 0;
+    let sliceQueued = false;
+    let lastInputAt = -Infinity;
+
+    function hasWork() {
+        return ingestQueue.length > 0 || domGen !== seenDomGen || msgGen !== seenMsgGen;
+    }
+
+    function noteInput() {
+        lastInputAt = performance.now();
+    }
+
+    function typingWait() {
+        return QUIET_MS - (performance.now() - lastInputAt);
+    }
+
+    function armWake(delay) {
+        if (wakeTimer) return;
+        wakeTimer = setTimeout(wake, delay);
+    }
+
+    function wake() {
+        wakeTimer = 0;
+        if (document.hidden || (!job && !hasWork())) return;
+        const wait = typingWait();
+        if (wait > 0) {
+            armWake(wait);
+            return;
+        }
+        if (sliceQueued) return;
+        sliceQueued = true;
+        const run = function () {
+            sliceQueued = false;
+            runSlice();
+        };
+        if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 500 });
+        else setTimeout(run, 1);
+    }
+
+    // A pass dropped by a key press loses little: harvested messages, normalized
+    // card text and painted chips all stay, and the next pass picks them up.
+    function runSlice() {
+        if (document.hidden) {
+            job = null;
+            return;
+        }
+        const wait = typingWait();
+        if (wait > 0) {
+            job = null;
+            armWake(wait);
+            return;
+        }
+        const until = performance.now() + SLICE_MS;
+        try {
+            if (!job) job = passSteps();
+            while (job && performance.now() < until) {
+                if (job.next().done) job = null;
+            }
+        } catch (err) {
+            job = null;
+            seenDomGen = domGen;
+            seenMsgGen = msgGen;
+            console.error('[GrokMsgTime]', err);
+        }
+        if (job) {
+            clearTimeout(wakeTimer);
+            wakeTimer = 0;
+            armWake(0);
+        } else if (hasWork()) {
+            armWake(DOM_DELAY_MS);
+        }
+    }
+
     function armSchedule() {
         schedule = function () {
-            if (renderTimer) return;
-            renderTimer = setTimeout(function () {
-                renderTimer = 0;
-                try { render(); } catch (err) {
-                    console.error('[GrokMsgTime]', err);
-                }
-            }, 160);
+            armWake(DOM_DELAY_MS);
         };
+    }
+
+    function poke() {
+        domGen++;
+        schedule();
+    }
+
+    function hasForeignNode(nodes) {
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            if (node.nodeType !== 1 || !node.classList.contains('grok-msg-time')) return true;
+        }
+        return false;
+    }
+
+    function mutationMatters(record) {
+        const node = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+        if (!node || node.closest(QUIET_ZONES)) return false;
+        if (record.type !== 'childList') return true;
+        return hasForeignNode(record.addedNodes) || hasForeignNode(record.removedNodes);
     }
 
     function injectStyle() {
@@ -1098,38 +1375,35 @@
         if (id !== activeBotId) {
             activeBotId = id;
             diagnosed = false;
+            job = null;
             setTimeout(diagnose, 8000);
         }
-        schedule();
+        poke();
     }
 
     function watchDom() {
         injectStyle();
         const target = document.body || document.documentElement;
         const observer = new MutationObserver(function (records) {
+            if (!isBotPage()) return;
             for (let i = 0; i < records.length; i++) {
-                const node = records[i].target;
-                if (node && node.nodeType === 1 && (node.classList.contains('grok-msg-time') || node.closest('.grok-msg-time'))) {
-                    continue;
-                }
-                schedule();
+                if (!mutationMatters(records[i])) continue;
+                poke();
                 return;
             }
         });
-        observer.observe(target, { childList: true, subtree: true });
+        observer.observe(target, { childList: true, subtree: true, characterData: true });
+        // Catches what mutations cannot show (a card measured late, a panel made
+        // visible) and ages the "N分钟前" labels.
         setInterval(function () {
-            if (isBotPage()) schedule();
-        }, 2000);
-        setInterval(function () {
-            const badges = document.querySelectorAll('.grok-msg-time');
-            for (let i = 0; i < badges.length; i++) {
-                const msg = messageById.get(badges[i].dataset.gmtId || '');
-                if (msg) fillBadge(badges[i], msg);
-            }
-        }, 30000);
+            if (isBotPage()) poke();
+        }, SWEEP_MS);
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) poke();
+        });
         activeBotId = currentBotId();
         setTimeout(diagnose, 8000);
-        schedule();
+        poke();
     }
 
     function boot() {
@@ -1155,7 +1429,10 @@
         };
         window.addEventListener('popstate', onRoute);
         window.addEventListener('hashchange', onRoute);
-        window.addEventListener('pageshow', schedule);
+        window.addEventListener('pageshow', poke);
+        ['keydown', 'beforeinput', 'compositionstart', 'compositionupdate'].forEach(function (type) {
+            window.addEventListener(type, noteInput, { capture: true, passive: true });
+        });
 
         const start = function () {
             if (document.documentElement && document.documentElement.dataset.gmtForce === '1') {
