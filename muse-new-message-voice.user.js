@@ -522,10 +522,12 @@
     }
 
     // Stay out of the way while a voice bubble or a call is playing on the page.
+    // The avatar is a looping video that never stops, so only audible media counts.
     function pagePlaying() {
         const media = document.querySelectorAll('audio, video');
         for (let i = 0; i < media.length; i++) {
-            if (!media[i].paused && !media[i].ended) return true;
+            const item = media[i];
+            if (!item.paused && !item.ended && !item.muted && item.volume > 0) return true;
         }
         return false;
     }
