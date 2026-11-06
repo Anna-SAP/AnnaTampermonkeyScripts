@@ -47,20 +47,22 @@
     const CROSS_TAB_MS = 15000;
     const HINT_DELAY_MS = 1200;
     const HINT_GAP_MS = 5000;
-    // The text lands first; the voice version follows once it has been generated.
     const VOICE_WAIT_MS = 180000;
+    const VOICE_KEEP_MS = 300000;
     const VOICE_LIMIT = 3;
-    const HISTORY_LIMIT = 40;
 
     const threads = new Map();
     const seenAt = new Map();
-    const voiceWatch = new Map();
-    const voicePlayed = new Set();
+    const voiceHeard = new Map();
+    const voiceWaiting = new Map();
+    const voiceSeen = new Set();
     const speech = { state: 'unknown', queue: [], busy: false, current: null, voice: null, voiceKey: '' };
     let config = loadConfig();
     let persisted = readJson(KEY_STATE, {});
     let client = null;
     let files = null;
+    let subscribed = null;
+    let unsubscribe = null;
     let holdTimer = 0;
     let baselined = false;
     let primaryId = '';
@@ -131,6 +133,9 @@
         if (id === watching) return;
         if (watching) seenAt.set(watching, Date.now());
         watching = id;
+        // The chat is on screen now, so its play button is right there.
+        voiceHeard.delete(id);
+        voiceWaiting.delete(id);
     }
 
     function hookHistory() {
@@ -238,7 +243,6 @@
             status: typeof item.status === 'string' ? item.status : '',
             updatedAt: Number(item.updated_at) || 0,
             turnFrom: Number(item.updated_at) || 0,
-            since: 0,
             announcedAt: 0
         };
     }
@@ -284,25 +288,26 @@
             const fresh = prev
                 ? isNews(prev, next)
                 : next.unread > 0 && (baselined || backlogIsNews(next.id)) && !viewing(next.id);
-            if (fresh) {
-                next.since = prev ? next.turnFrom : ((persisted[next.id] || {}).a || 0);
-                news.push(next);
-            }
+            if (fresh) news.push(next);
             if (!prev || (prev.unread > 0) !== (next.unread > 0)) dirty = true;
         }
         baselined = true;
         noteAttention();
         updateTitle();
+        subscribeVoice();
         if (dirty) savePersisted();
         if (news.length) announce(news);
-        voiceWatch.forEach(function (watch, id) { checkVoice(id); });
+        voiceWaiting.forEach(function (until, id) {
+            const thread = threads.get(id);
+            if (!thread || thread.status !== 'running' || Date.now() > until) voiceWaiting.delete(id);
+        });
     }
 
     function savePersisted() {
         const now = Date.now();
         const latest = readJson(KEY_STATE, {});
         threads.forEach(function (thread) {
-            latest[thread.id] = { u: thread.unread > 0 ? 1 : 0, a: thread.updatedAt, t: now };
+            latest[thread.id] = { u: thread.unread > 0 ? 1 : 0, t: now };
         });
         const ids = Object.keys(latest);
         if (ids.length > 500) {
@@ -373,6 +378,7 @@
         }
         client = found;
         client.getQueryCache().subscribe(onCacheEvent);
+        subscribeVoice();
         const query = listQuery();
         if (query) onServerList(query.state.data);
         schedulePoll();
@@ -425,71 +431,48 @@
             say(text, names.length <= 3 ? [ids[i]] : ids);
         });
         // A merged "A、B 等 5 个" line has no single chat to play a voice from.
-        if (fresh.length <= 3) fresh.forEach(wantVoice);
+        if (fresh.length <= 3) {
+            fresh.forEach(function (thread) { wantVoice(thread); });
+        }
     }
 
     // ---------- Muse's own voice messages ----------
-    // A voice reply is a delta.presentation event of kind "audio" that follows
-    // the text. The audio file lives in the sandbox, so the page reads it over
-    // the gateway. chat.history works for chats that are not open and does not
-    // mark them read.
-    async function chatEvents(id) {
-        const gateway = findGateway();
-        if (!gateway) return null;
-        const reply = await gateway.sendRequest('chat.history', { session_id: id, limit: HISTORY_LIMIT, transcript_mode: 'messages' });
-        const data = reply && (reply.chat_events ? reply : reply.data);
-        return data && Array.isArray(data.chat_events) ? data.chat_events : null;
-    }
-
-    function voicesIn(events, since) {
-        const found = [];
-        for (let i = events.length - 1; i >= 0; i--) {
-            const event = events[i];
-            // updated_at has whole seconds, so the last turn's voice can sit just past it.
-            if (event.role === 'user' || Number(event.occurred_at_ms) <= since + 1000) break;
-            const payload = event.payload || {};
-            const audio = payload.kind === 'audio' && payload.data && payload.data.audio;
-            if (!audio || audio.missing || typeof audio.path !== 'string' || voicePlayed.has(event.message_id)) continue;
-            found.unshift({ id: event.message_id, path: audio.path, mime: audio.mime || 'audio/mpeg' });
-        }
-        return found.slice(-VOICE_LIMIT);
-    }
-
-    function wantVoice(thread) {
-        if (!config.playVoice) return;
-        const watch = voiceWatch.get(thread.id);
-        if (watch) {
-            watch.since = Math.min(watch.since, thread.since);
-            watch.until = Date.now() + VOICE_WAIT_MS;
-        } else {
-            voiceWatch.set(thread.id, { since: thread.since, until: Date.now() + VOICE_WAIT_MS, rounds: 0, busy: false });
-        }
-        checkVoice(thread.id);
-    }
-
-    async function checkVoice(id) {
-        const watch = voiceWatch.get(id);
-        if (!watch || watch.busy) return;
-        if (viewing(id)) {
-            voiceWatch.delete(id);
+    // A voice reply is pushed as a delta.presentation of kind "audio", for every
+    // chat whether it is open or not. It lands a few seconds before the chat
+    // list shows the turn ended, so it waits here for the announcement.
+    function onPresentation(event) {
+        const audio = event && event.kind === 'audio' && event.data && event.data.audio;
+        if (!audio || audio.missing || typeof audio.path !== 'string' || !config.playVoice) return;
+        const id = event.is_thread === false ? primaryId : event.session_id;
+        if (!id || voiceSeen.has(event.message_id) || viewing(id)) return;
+        voiceSeen.add(event.message_id);
+        const voice = { path: audio.path, mime: audio.mime || 'audio/mpeg', at: Date.now() };
+        if (voiceWaiting.has(id)) {
+            queueVoice(id, voice);
             return;
         }
-        watch.busy = true;
-        watch.rounds++;
-        let found = [];
-        try {
-            const events = await chatEvents(id);
-            if (events) found = voicesIn(events, watch.since);
-        } catch (err) {
-            log('读取聊天记录失败', err);
+        voiceHeard.set(id, (voiceHeard.get(id) || []).concat(voice).slice(-VOICE_LIMIT));
+    }
+
+    function subscribeVoice() {
+        const gateway = findGateway();
+        if (!gateway || gateway === subscribed || typeof gateway.onEvent !== 'function') return;
+        if (unsubscribe) {
+            try { unsubscribe(); } catch (err) {}
         }
-        watch.busy = false;
-        found.forEach(function (voice) { voicePlayed.add(voice.id); });
-        const thread = threads.get(id);
-        // One more list after the turn ends, in case the event trails the status.
-        const settled = !!thread && thread.status !== 'running' && watch.rounds >= 2;
-        if (found.length || settled || Date.now() > watch.until) voiceWatch.delete(id);
-        for (let i = 0; i < found.length; i++) await queueVoice(id, found[i]);
+        subscribed = gateway;
+        unsubscribe = gateway.onEvent('delta.presentation', onPresentation);
+    }
+
+    async function wantVoice(thread) {
+        const now = Date.now();
+        const voices = (voiceHeard.get(thread.id) || []).filter(function (voice) {
+            return now - voice.at < VOICE_KEEP_MS;
+        });
+        voiceHeard.delete(thread.id);
+        // Announced on the text while the turn is still going: the voice may follow.
+        if (!voices.length && thread.status === 'running') voiceWaiting.set(thread.id, now + VOICE_WAIT_MS);
+        for (let i = 0; i < voices.length; i++) await queueVoice(thread.id, voices[i]);
     }
 
     function toBlob(base64, mime) {
@@ -1013,20 +996,12 @@
                     聊天数: threads.size,
                     上次列表: lastList ? Math.round((Date.now() - lastList) / 1000) + ' 秒前' : '还没有',
                     轮询: pollMs() ? pollMs() / 1000 + ' 秒一次' : '已关闭',
-                    语音回放: config.playVoice ? '开，等待中 ' + voiceWatch.size + ' 个聊天' : '关',
+                    语音回放: !config.playVoice ? '关' : (subscribed ? '开，已连接' : '开，还没连上网关'),
                     当前聊天: activeThreadId() ? displayName(threads.get(activeThreadId()) || { title: '' }) : '无',
                     待播报: pendingItems().map(function (item) { return item.text; })
                 };
             },
             refresh: refresh,
-            // Plays the newest voice message of the open chat, or of a given chat id.
-            playLatest: async function (id) {
-                const target = id || activeThreadId();
-                const events = target ? await chatEvents(target) : null;
-                const voice = events ? voicesIn(events, 0).pop() : null;
-                if (voice) await queueVoice(target, voice);
-                return voice ? '已加入播放队列' : '最新一轮没有语音';
-            },
             test: function (name) {
                 say(fill(name || config.mainName || DEFAULTS.mainName), primaryId ? [primaryId] : []);
                 return speech.state;
@@ -1080,7 +1055,7 @@
             }
         };
         if (window.__MNV_TEST__) {
-            window.__MNV = { threads: threads, seenAt: seenAt, speech: speech, voiceWatch: voiceWatch, voicePlayed: voicePlayed, onServerList: onServerList, isNews: isNews, viewing: viewing, displayName: displayName, chatEvents: chatEvents, voicesIn: voicesIn, findFiles: findFiles, findGateway: findGateway };
+            window.__MNV = { threads: threads, seenAt: seenAt, speech: speech, voiceHeard: voiceHeard, voiceWaiting: voiceWaiting, voiceSeen: voiceSeen, onServerList: onServerList, onPresentation: onPresentation, isNews: isNews, viewing: viewing, displayName: displayName, findFiles: findFiles, findGateway: findGateway };
         }
     }
 
