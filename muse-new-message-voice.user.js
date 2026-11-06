@@ -196,10 +196,13 @@
         if (viewing(next.id)) return false;
         if (next.updatedAt <= (seenAt.get(next.id) || 0)) return false;
         if (next.unread > prev.unread) return true;
-        // The page can mark the open chat read itself, leaving unread at 0, so a
-        // finished turn counts too. Only with nobody at the page: renaming a chat
-        // may also move updated_at, and a silent heartbeat run does not.
-        return !attended() && next.status !== 'running' && next.updatedAt > prev.updatedAt;
+        if (next.status === 'running' || next.updatedAt <= prev.updatedAt) return false;
+        // Something was added and the turn is over. unread_count alone misses
+        // this: it sat at 1 across a real reply while the page's mark-read was in
+        // flight, and it stays 0 when the page marks the open chat read itself.
+        // Renaming a chat may also move updated_at, so a read chat needs a turn
+        // that just ended, or nobody at the page. A silent heartbeat moves nothing.
+        return next.unread > 0 || prev.status === 'running' || !attended();
     }
 
     // Only lists from the server land here. A pushed update bumps unread_count
