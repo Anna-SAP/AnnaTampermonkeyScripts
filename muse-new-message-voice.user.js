@@ -2,9 +2,9 @@
 // @name         Muse New Message Voice
 // @name:zh-CN   Muse 新消息语音播报
 // @namespace    https://github.com/Anna-SAP/AnnaTampermonkeyScripts
-// @version      1.0.0
-// @description  Speak "Muse「<chat>」有新的消息请查收" when a Muse chat gets a new message. Reads the chat list the page keeps in memory and refreshes it every 20 seconds, so side chats folded away in the sidebar are covered too.
-// @description:zh-CN Muse 的主要聊天或任意旁聊收到新消息时，用浏览器语音朗读「Muse「[聊天标题]」有新的消息请查收」。Muse 的连接全程加密，脚本读取页面自己的聊天列表（含未读数和运行状态），每 20 秒让页面刷新一次，所以侧栏折叠起来的旁聊也能听到。正在看的那个聊天不播报；发完消息切走，回复到了会提醒。页面没点过之前浏览器不让出声，脚本会先排队，并在标签页图标上显示数字角标，点一下页面就补播。
+// @version      1.1.0
+// @description  Speak "Muse「<chat>」有新的消息请查收" when a Muse chat gets a new message, then play the voice message that came with the reply. Reads the chat list the page keeps in memory and refreshes it every 20 seconds, so side chats folded away in the sidebar are covered too.
+// @description:zh-CN Muse 的主要聊天或任意旁聊收到新消息时，用浏览器语音朗读「Muse「[聊天标题]」有新的消息请查收」，如果这条回复带语音版，紧接着自动播放 Muse 的语音。Muse 的连接全程加密，脚本读取页面自己的聊天列表（含未读数和运行状态），每 20 秒让页面刷新一次，所以侧栏折叠起来的旁聊也能听到。正在看的那个聊天不播报；发完消息切走，回复到了会提醒。页面没点过之前浏览器不让出声，脚本会先排队，并在标签页图标上显示数字角标，点一下页面就补播。
 // @author       Anna-SAP
 // @match        https://muse.ai/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=muse.ai
@@ -35,7 +35,9 @@
         onLoad: 'away',
         toast: true,
         notify: false,
-        pollSec: 20
+        pollSec: 20,
+        playVoice: true,
+        voiceVolume: 1
     };
     const LIST_KEY = 'thread-sessions';
     const ROW_SELECTOR = '[data-testid="hatch-thread-row"]';
@@ -45,13 +47,21 @@
     const CROSS_TAB_MS = 15000;
     const HINT_DELAY_MS = 1200;
     const HINT_GAP_MS = 5000;
+    // The text lands first; the voice version follows once it has been generated.
+    const VOICE_WAIT_MS = 180000;
+    const VOICE_LIMIT = 3;
+    const HISTORY_LIMIT = 40;
 
     const threads = new Map();
     const seenAt = new Map();
+    const voiceWatch = new Map();
+    const voicePlayed = new Set();
     const speech = { state: 'unknown', queue: [], busy: false, current: null, voice: null, voiceKey: '' };
     let config = loadConfig();
     let persisted = readJson(KEY_STATE, {});
     let client = null;
+    let files = null;
+    let holdTimer = 0;
     let baselined = false;
     let primaryId = '';
     let watching = '';
@@ -151,16 +161,62 @@
         return null;
     }
 
-    function findClient() {
+    function seedFiber() {
         const seeds = document.querySelectorAll('button, a, input, textarea');
         for (let i = 0; i < seeds.length && i < 40; i++) {
-            let fiber = fiberOf(seeds[i]);
-            for (let depth = 0; fiber && depth < 1000; depth++, fiber = fiber.return) {
-                const props = fiber.memoizedProps;
-                const found = props && (props.client || props.value);
-                if (found && typeof found.getQueryCache === 'function') return found;
+            const fiber = fiberOf(seeds[i]);
+            if (fiber) return fiber;
+        }
+        return null;
+    }
+
+    function climb(pick) {
+        let fiber = seedFiber();
+        for (let depth = 0; fiber && depth < 1000; depth++, fiber = fiber.return) {
+            const found = fiber.memoizedProps && pick(fiber.memoizedProps);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    function findClient() {
+        return climb(function (props) {
+            const found = props.client || props.value;
+            return found && typeof found.getQueryCache === 'function' ? found : null;
+        });
+    }
+
+    function findGateway() {
+        return climb(function (props) {
+            return props.value && typeof props.value.sendRequest === 'function' ? props.value : null;
+        });
+    }
+
+    function isFiles(value) {
+        return !!value && typeof value.read === 'function' && typeof value.list === 'function' && typeof value.uploadFile === 'function';
+    }
+
+    // The page's file API sits in a useMemo inside the chat shell, not in a
+    // context, so finding it takes a walk down the tree.
+    function findFiles() {
+        if (files) return files;
+        let root = seedFiber();
+        while (root && root.return) root = root.return;
+        if (!root) return null;
+        const stack = [root.stateNode && root.stateNode.current ? root.stateNode.current : root];
+        for (let steps = 0; stack.length && steps < 300000; steps++) {
+            const fiber = stack.pop();
+            let hook = fiber.memoizedState;
+            for (let i = 0; hook && typeof hook === 'object' && 'next' in hook && i < 120; i++, hook = hook.next) {
+                const value = hook.memoizedState;
+                const candidate = Array.isArray(value) ? value[0] : value;
+                if (isFiles(candidate)) {
+                    files = candidate;
+                    return files;
+                }
             }
-            if (fiberOf(seeds[i])) return null;
+            if (fiber.sibling) stack.push(fiber.sibling);
+            if (fiber.child) stack.push(fiber.child);
         }
         return null;
     }
@@ -181,6 +237,8 @@
             unread: Number(item.unread_count) || 0,
             status: typeof item.status === 'string' ? item.status : '',
             updatedAt: Number(item.updated_at) || 0,
+            turnFrom: Number(item.updated_at) || 0,
+            since: 0,
             announcedAt: 0
         };
     }
@@ -196,7 +254,7 @@
         if (viewing(next.id)) return false;
         if (next.updatedAt <= (seenAt.get(next.id) || 0)) return false;
         if (next.unread > prev.unread) return true;
-        if (next.status === 'running' || next.updatedAt <= prev.updatedAt) return false;
+        if (next.status === 'running' || next.updatedAt <= next.turnFrom) return false;
         // Something was added and the turn is over. unread_count alone misses
         // this: it sat at 1 across a real reply while the page's mark-read was in
         // flight, and it stays 0 when the page marks the open chat read itself.
@@ -219,11 +277,17 @@
             const next = readThread(item);
             const prev = threads.get(next.id);
             if (prev) next.announcedAt = prev.announcedAt;
+            // A refresh can land mid-turn after the last write, so the end of a
+            // turn is measured from where the turn started.
+            if (prev) next.turnFrom = prev.status === 'running' ? prev.turnFrom : prev.updatedAt;
             threads.set(next.id, next);
             const fresh = prev
                 ? isNews(prev, next)
                 : next.unread > 0 && (baselined || backlogIsNews(next.id)) && !viewing(next.id);
-            if (fresh) news.push(next);
+            if (fresh) {
+                next.since = prev ? next.turnFrom : ((persisted[next.id] || {}).a || 0);
+                news.push(next);
+            }
             if (!prev || (prev.unread > 0) !== (next.unread > 0)) dirty = true;
         }
         baselined = true;
@@ -231,13 +295,14 @@
         updateTitle();
         if (dirty) savePersisted();
         if (news.length) announce(news);
+        voiceWatch.forEach(function (watch, id) { checkVoice(id); });
     }
 
     function savePersisted() {
         const now = Date.now();
         const latest = readJson(KEY_STATE, {});
         threads.forEach(function (thread) {
-            latest[thread.id] = { u: thread.unread > 0 ? 1 : 0, t: now };
+            latest[thread.id] = { u: thread.unread > 0 ? 1 : 0, a: thread.updatedAt, t: now };
         });
         const ids = Object.keys(latest);
         if (ids.length > 500) {
@@ -359,6 +424,157 @@
         phrasesFor(names).forEach(function (text, i) {
             say(text, names.length <= 3 ? [ids[i]] : ids);
         });
+        // A merged "A、B 等 5 个" line has no single chat to play a voice from.
+        if (fresh.length <= 3) fresh.forEach(wantVoice);
+    }
+
+    // ---------- Muse's own voice messages ----------
+    // A voice reply is a delta.presentation event of kind "audio" that follows
+    // the text. The audio file lives in the sandbox, so the page reads it over
+    // the gateway. chat.history works for chats that are not open and does not
+    // mark them read.
+    async function chatEvents(id) {
+        const gateway = findGateway();
+        if (!gateway) return null;
+        const reply = await gateway.sendRequest('chat.history', { session_id: id, limit: HISTORY_LIMIT, transcript_mode: 'messages' });
+        const data = reply && (reply.chat_events ? reply : reply.data);
+        return data && Array.isArray(data.chat_events) ? data.chat_events : null;
+    }
+
+    function voicesIn(events, since) {
+        const found = [];
+        for (let i = events.length - 1; i >= 0; i--) {
+            const event = events[i];
+            // updated_at has whole seconds, so the last turn's voice can sit just past it.
+            if (event.role === 'user' || Number(event.occurred_at_ms) <= since + 1000) break;
+            const payload = event.payload || {};
+            const audio = payload.kind === 'audio' && payload.data && payload.data.audio;
+            if (!audio || audio.missing || typeof audio.path !== 'string' || voicePlayed.has(event.message_id)) continue;
+            found.unshift({ id: event.message_id, path: audio.path, mime: audio.mime || 'audio/mpeg' });
+        }
+        return found.slice(-VOICE_LIMIT);
+    }
+
+    function wantVoice(thread) {
+        if (!config.playVoice) return;
+        const watch = voiceWatch.get(thread.id);
+        if (watch) {
+            watch.since = Math.min(watch.since, thread.since);
+            watch.until = Date.now() + VOICE_WAIT_MS;
+        } else {
+            voiceWatch.set(thread.id, { since: thread.since, until: Date.now() + VOICE_WAIT_MS, rounds: 0, busy: false });
+        }
+        checkVoice(thread.id);
+    }
+
+    async function checkVoice(id) {
+        const watch = voiceWatch.get(id);
+        if (!watch || watch.busy) return;
+        if (viewing(id)) {
+            voiceWatch.delete(id);
+            return;
+        }
+        watch.busy = true;
+        watch.rounds++;
+        let found = [];
+        try {
+            const events = await chatEvents(id);
+            if (events) found = voicesIn(events, watch.since);
+        } catch (err) {
+            log('读取聊天记录失败', err);
+        }
+        watch.busy = false;
+        found.forEach(function (voice) { voicePlayed.add(voice.id); });
+        const thread = threads.get(id);
+        // One more list after the turn ends, in case the event trails the status.
+        const settled = !!thread && thread.status !== 'running' && watch.rounds >= 2;
+        if (found.length || settled || Date.now() > watch.until) voiceWatch.delete(id);
+        for (let i = 0; i < found.length; i++) await queueVoice(id, found[i]);
+    }
+
+    function toBlob(base64, mime) {
+        const text = atob(base64);
+        const bytes = new Uint8Array(text.length);
+        for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+        return new Blob([bytes], { type: mime });
+    }
+
+    async function queueVoice(id, voice) {
+        try {
+            const api = findFiles();
+            if (!api) {
+                log('还没找到页面的文件接口，这条语音跳过');
+                return;
+            }
+            const reply = await api.read(voice.path, { encoding: 'base64' });
+            const data = reply && reply.data;
+            if (!reply || !reply.ok || !data || data.encoding !== 'base64' || !data.content) {
+                files = null;
+                log('读取语音失败', voice.path);
+                return;
+            }
+            speech.queue.push({ text: 'Muse 语音', url: URL.createObjectURL(toBlob(data.content, voice.mime)), ids: [id], at: Date.now() });
+            pump();
+        } catch (err) {
+            files = null;
+            log('读取语音失败', err);
+        }
+    }
+
+    // Stay out of the way while a voice bubble or a call is playing on the page.
+    function pagePlaying() {
+        const media = document.querySelectorAll('audio, video');
+        for (let i = 0; i < media.length; i++) {
+            if (!media[i].paused && !media[i].ended) return true;
+        }
+        return false;
+    }
+
+    function playVoice(item) {
+        const audio = new Audio(item.url);
+        audio.volume = clamp(config.voiceVolume, 0, 1, 1);
+        let over = false;
+        let guard = 0;
+        const finish = function (keep) {
+            if (over) return;
+            over = true;
+            clearTimeout(guard);
+            speech.busy = false;
+            speech.current = null;
+            if (!keep) {
+                const index = speech.queue.indexOf(item);
+                if (index !== -1) speech.queue.splice(index, 1);
+                URL.revokeObjectURL(item.url);
+            }
+            refreshUi();
+        };
+        const next = function () {
+            finish(false);
+            setTimeout(pump, 0);
+        };
+        audio.onended = next;
+        audio.onerror = function () {
+            log('语音播放出错');
+            next();
+        };
+        // A media key can pause this with no ended event to follow.
+        audio.onloadedmetadata = function () {
+            if (Number.isFinite(audio.duration)) guard = setTimeout(next, (audio.duration + 15) * 1000);
+        };
+        speech.busy = true;
+        speech.current = audio;
+        const started = audio.play();
+        if (started && started.catch) {
+            started.catch(function (err) {
+                if (err && err.name === 'NotAllowedError') {
+                    speech.state = 'locked';
+                    finish(true);
+                    return;
+                }
+                log('语音播放出错', err);
+                next();
+            });
+        }
     }
 
     function say(text, ids) {
@@ -437,7 +653,7 @@
 
     function pump() {
         const s = synth();
-        if (!s || speech.busy || !speech.queue.length) {
+        if (speech.busy || !speech.queue.length) {
             refreshUi();
             return;
         }
@@ -446,6 +662,19 @@
             return;
         }
         const item = speech.queue[0];
+        if (item.url) {
+            if (pagePlaying()) {
+                clearTimeout(holdTimer);
+                holdTimer = setTimeout(pump, 1500);
+                return;
+            }
+            playVoice(item);
+            return;
+        }
+        if (!s) {
+            refreshUi();
+            return;
+        }
         const voice = item.plain ? null : currentVoice();
         const utter = new SpeechSynthesisUtterance(item.text);
         utter.lang = voice ? voice.lang : 'zh-CN';
@@ -627,7 +856,7 @@
     }
 
     function pendingItems() {
-        return speech.queue.filter(function (item) { return !item.silent; });
+        return speech.queue.filter(function (item) { return !item.silent && !item.url; });
     }
 
     function refreshUi() {
@@ -782,11 +1011,20 @@
                     聊天数: threads.size,
                     上次列表: lastList ? Math.round((Date.now() - lastList) / 1000) + ' 秒前' : '还没有',
                     轮询: pollMs() ? pollMs() / 1000 + ' 秒一次' : '已关闭',
+                    语音回放: config.playVoice ? '开，等待中 ' + voiceWatch.size + ' 个聊天' : '关',
                     当前聊天: activeThreadId() ? displayName(threads.get(activeThreadId()) || { title: '' }) : '无',
                     待播报: pendingItems().map(function (item) { return item.text; })
                 };
             },
             refresh: refresh,
+            // Plays the newest voice message of the open chat, or of a given chat id.
+            playLatest: async function (id) {
+                const target = id || activeThreadId();
+                const events = target ? await chatEvents(target) : null;
+                const voice = events ? voicesIn(events, 0).pop() : null;
+                if (voice) await queueVoice(target, voice);
+                return voice ? '已加入播放队列' : '最新一轮没有语音';
+            },
             test: function (name) {
                 say(fill(name || config.mainName || DEFAULTS.mainName), primaryId ? [primaryId] : []);
                 return speech.state;
@@ -840,7 +1078,7 @@
             }
         };
         if (window.__MNV_TEST__) {
-            window.__MNV = { threads: threads, seenAt: seenAt, speech: speech, onServerList: onServerList, isNews: isNews, viewing: viewing, displayName: displayName };
+            window.__MNV = { threads: threads, seenAt: seenAt, speech: speech, voiceWatch: voiceWatch, voicePlayed: voicePlayed, onServerList: onServerList, isNews: isNews, viewing: viewing, displayName: displayName, chatEvents: chatEvents, voicesIn: voicesIn, findFiles: findFiles, findGateway: findGateway };
         }
     }
 
